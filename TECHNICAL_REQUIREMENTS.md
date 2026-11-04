@@ -71,7 +71,7 @@ The server's planned capability areas are:
 - **Environments:** Persist environment data and enforce its visibility and scope.
 - **Synchronization:** Support exchanging persistent Restling state between authorized clients and the hosted service.
 
-These areas describe the intended product scope, **not an approved database schema or finalized API design**. Specific roles, authentication mechanisms, synchronization/conflict rules, and environment resolution semantics require separate design decisions before implementation.
+Initial system and project roles are defined in `docs/architecture/USER_ROLE_MANAGEMENT.md`. Detailed capability permissions, ownership cardinality, and membership workflows remain subject to further design.
 
 The initial implementation should proceed incrementally, beginning with the capabilities selected for the first milestone. A capability listed here is not automatically a requirement to implement it in the first release.
 
