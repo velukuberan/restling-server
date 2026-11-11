@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.14,<2.0",
+    "argon2-cffi>=25.1.0",
     "fastapi>=0.115,<1.0",
     "psycopg[binary]>=3.2,<4.0",
     "pydantic-settings>=2,<3",
@@ -44,3 +45,9 @@ select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
 include = ["src", "tests"]
+
+[tool.setuptools.package-data]
+"restling_server.users" = [
+    "data/blocked_passwords.txt",
+    "data/SECLISTS_LICENSE",
+]
