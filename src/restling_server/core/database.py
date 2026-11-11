@@ -1,9 +1,13 @@
 """Shared PostgreSQL connection and session infrastructure."""
 
 from sqlalchemy import URL, Engine, create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from restling_server.core.config import Settings
+
+
+class Base(DeclarativeBase):
+    """Base class for application database models."""
 
 
 def create_database_engine(settings: Settings) -> Engine:

@@ -4,9 +4,10 @@ from alembic import context
 
 from restling_server.core.config import Settings
 from restling_server.core.database import create_database_engine
+from restling_server.users.models import User
 
 # ORM metadata will be registered when models are introduced.
-target_metadata = None
+target_metadata = User.metadata
 
 
 def run_migrations_online() -> None:
