@@ -22,6 +22,22 @@ class AdministratorAlreadyInitializedError(Exception):
     """Initial administrator bootstrap is no longer permitted."""
 
 
+class UserCreationNotAllowedError(Exception):
+    """The actor cannot create user accounts."""
+
+
+class UserAlreadyExistsError(Exception):
+    """A user account with this email already exists."""
+
+
+class InvitationNotAllowedError(Exception):
+    """The invitation cannot be issued for this actor or account."""
+
+
+class InvalidActivationTokenError(Exception):
+    """The activation credential is invalid or no longer usable."""
+
+
 def bootstrap_administrator(
     session: Session,
     *,
@@ -85,14 +101,6 @@ def bootstrap_administrator(
         session.flush()
 
     return administrator
-
-
-class UserCreationNotAllowedError(Exception):
-    """The actor cannot create user accounts."""
-
-
-class UserAlreadyExistsError(Exception):
-    """A user account with this email already exists."""
 
 
 def create_user(
@@ -176,10 +184,6 @@ def create_user(
     return user
 
 
-class InvitationNotAllowedError(Exception):
-    """The invitation cannot be issued for this actor or account."""
-
-
 def issue_activation_token(
     session: Session,
     *,
@@ -238,3 +242,74 @@ def issue_activation_token(
         session.flush()
 
     return raw_token, expires_at
+
+
+def activate_user(
+    session: Session,
+    *,
+    token: str,
+    password: str,
+) -> None:
+    """Activate a pending user with a valid one-time credential."""
+
+    token_digest = hash_token(token)
+
+    with session.begin():
+        # Look up the credential without locking the token row yet.
+        token_user_id = session.scalar(
+            select(OneTimeToken.user_id).where(
+                OneTimeToken.token_hash == token_digest,
+                OneTimeToken.purpose == "account_activation",
+            )
+        )
+
+        if token_user_id is None:
+            raise InvalidActivationTokenError(
+                "Invalid or expired activation credential."
+            )
+
+        # Lock the user first, matching invitation issuance lock order.
+        user = session.scalar(
+            select(User).where(User.id == token_user_id).with_for_update()
+        )
+
+        if user is None or user.status != "pending":
+            raise InvalidActivationTokenError(
+                "Invalid or expired activation credential."
+            )
+
+        # Re-read and lock the token after acquiring the user lock.
+        # It may have been revoked by another transaction meanwhile.
+        stored_token = session.scalar(
+            select(OneTimeToken)
+            .where(
+                OneTimeToken.token_hash == token_digest,
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose == "account_activation",
+            )
+            .with_for_update()
+        )
+
+        now = datetime.now(UTC)
+
+        if (
+            stored_token is None
+            or stored_token.expires_at <= now
+            or stored_token.consumed_at is not None
+            or stored_token.revoked_at is not None
+        ):
+            raise InvalidActivationTokenError(
+                "Invalid or expired activation credential."
+            )
+
+        # Validate the password only after confirming the token is usable.
+        validate_password(password)
+
+        user.password_hash = hash_password(password)
+        user.password_reset_required = False
+        user.status = "active"
+        user.activated_at = now
+
+        stored_token.consumed_at = now
+
+        session.flush()
