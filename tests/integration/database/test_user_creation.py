@@ -1,5 +1,8 @@
 """PostgreSQL integration tests for user creation."""
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 from sqlalchemy import Engine, delete, select
 from sqlalchemy.orm import Session
@@ -407,6 +410,72 @@ def test_create_user_rejects_long_job_title(
             )
 
             assert user is None
+
+    finally:
+        with test_engine.begin() as connection:
+            connection.execute(
+                delete(User).where(User.normalized_email.in_([admin_email, user_email]))
+            )
+
+
+def test_concurrent_duplicate_user_creation(
+    test_engine: Engine,
+) -> None:
+    """Concurrent requests cannot create duplicate user accounts."""
+    admin_email = "concurrent-admin@example.com"
+    user_email = "concurrent-user@example.com"
+
+    try:
+        with Session(test_engine) as session:
+            administrator = bootstrap_administrator(
+                session,
+                email=admin_email,
+                display_name="Administrator",
+                password="A secure administrator passphrase #8472",
+            )
+            administrator_id = administrator.id
+
+        barrier = Barrier(2)
+
+        def attempt_creation(email: str) -> str:
+            barrier.wait(timeout=10)
+
+            with Session(test_engine) as session:
+                try:
+                    create_user(
+                        session,
+                        actor_id=administrator_id,
+                        email=email,
+                        display_name="Concurrent User",
+                    )
+                except UserAlreadyExistsError:
+                    return "duplicate"
+
+            return "created"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    attempt_creation,
+                    "Concurrent-User@Example.com",
+                ),
+                executor.submit(
+                    attempt_creation,
+                    user_email,
+                ),
+            ]
+
+            results = [future.result(timeout=15) for future in futures]
+
+        assert sorted(results) == ["created", "duplicate"]
+
+        with Session(test_engine) as session:
+            users = session.scalars(
+                select(User).where(User.normalized_email == user_email)
+            ).all()
+
+            assert len(users) == 1
+            assert users[0].status == "pending"
 
     finally:
         with test_engine.begin() as connection:

@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -43,6 +44,10 @@ class User(Base):
             """,
             name="ck_users_password_state",
         ),
+        UniqueConstraint(
+            "normalized_email",
+            name="users_normalized_email_key",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -55,7 +60,6 @@ class User(Base):
 
     normalized_email: Mapped[str] = mapped_column(
         Text,
-        unique=True,
         nullable=False,
     )
 
