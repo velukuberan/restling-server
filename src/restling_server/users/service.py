@@ -1,6 +1,6 @@
 """Application operations for user management."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from email_validator import EmailNotValidError, validate_email
@@ -9,8 +9,9 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from restling_server.users.models import User
+from restling_server.users.models import OneTimeToken, User
 from restling_server.users.passwords import hash_password, validate_password
+from restling_server.users.tokens import generate_token, hash_token
 
 # PostgreSQL advisory-lock identifiers reserved for administrator bootstrap.
 _BOOTSTRAP_LOCK_NAMESPACE = 723941
@@ -173,3 +174,67 @@ def create_user(
         raise
 
     return user
+
+
+class InvitationNotAllowedError(Exception):
+    """The invitation cannot be issued for this actor or account."""
+
+
+def issue_activation_token(
+    session: Session,
+    *,
+    actor_id: UUID,
+    user_id: UUID,
+    expiry_hours: int,
+) -> tuple[str, datetime]:
+    """Issue or replace an activation token for a pending user."""
+    if expiry_hours < 1:
+        raise ValueError("Invitation expiry must be at least one hour.")
+
+    with session.begin():
+        actor = session.get(User, actor_id)
+
+        if (
+            actor is None
+            or actor.system_role != "administrator"
+            or actor.status != "active"
+        ):
+            raise InvitationNotAllowedError("Administrator privileges are required.")
+
+        # Serialize issuance and replacement for this user.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None or user.status != "pending":
+            raise InvitationNotAllowedError("Account is not eligible for activation.")
+
+        now = datetime.now(UTC)
+
+        # Invalidate previous usable activation invitations.
+        existing_tokens = session.scalars(
+            select(OneTimeToken).where(
+                OneTimeToken.user_id == user_id,
+                OneTimeToken.purpose == "account_activation",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+        ).all()
+
+        for existing_token in existing_tokens:
+            existing_token.revoked_at = now
+
+        raw_token = generate_token()
+        expires_at = now + timedelta(hours=expiry_hours)
+
+        token = OneTimeToken(
+            user_id=user.id,
+            purpose="account_activation",
+            token_hash=hash_token(raw_token),
+            pending_email=None,
+            created_at=now,
+            expires_at=expires_at,
+        )
+
+        session.add(token)
+        session.flush()
+
+    return raw_token, expires_at

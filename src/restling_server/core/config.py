@@ -18,3 +18,9 @@ class Settings(BaseSettings):
 
     postgres_host: str = "127.0.0.1"
     postgres_port: int = Field(default=5432, ge=1, le=65535)
+
+    invitation_expiry_hours: int = Field(
+        default=24,
+        ge=1,
+        validation_alias="RESTLING_INVITATION_EXPIRY_HOURS",
+    )
