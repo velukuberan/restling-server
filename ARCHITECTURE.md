@@ -6,7 +6,10 @@
 
 ## 1. Purpose and authority
 
-Restling Server provides the centrally hosted, multi-user backend for the Restling API client. Its responsibilities include account management and, progressively, access-controlled projects, collections, environments, and synchronization.
+Restling Server provides the multi-user backend for the Restling API client. It supports centrally hosted and privately self-hosted deployments using the same application architecture and REST API contracts.
+
+Its responsibilities include account management and, progressively, access-controlled projects, collections, environments, and
+synchronization.
 
 This document defines the intended **module boundaries, ownership, dependency rules, and execution model**. `TECHNICAL_REQUIREMENTS.md` defines selected technologies and capabilities; `CODING_STANDARDS.md` defines implementation and quality rules. This document does not itself approve an endpoint catalogue, data schema, authentication protocol, permission matrix, or sync conflict algorithm.
 
@@ -190,7 +193,7 @@ Avoid encoding a speculative fixed relationship between every project, collectio
 
 ## 11. Synchronization boundary
 
-Synchronization is a planned feature of the hosted server, not just a generic CRUD endpoint.
+Synchronization is a planned capability of Restling Server, regardless of whether the server is centrally hosted or privately self-hosted. It is not merely a generic CRUD endpoint.
 
 - Sync operations authenticate the actor and authorize every affected resource.
 - The server validates scope and ownership independently of client-supplied IDs.
@@ -199,7 +202,9 @@ Synchronization is a planned feature of the hosted server, not just a generic CR
 - Decide offline change representation, versioning, conflict detection/resolution, deletion semantics, and idempotency before implementing sync behavior.
 - Do not introduce event buses, distributed queues, change-data-capture, or WebSockets merely as placeholders for possible future synchronization needs.
 
-A separately documented, published API/protocol for third-party servers may be considered only when it becomes a committed requirement for this repository. The initial centrally hosted deployment does not imply a compatibility obligation to unimplemented alternate servers.
+Restling Server maintains consistent REST API contracts across its supported deployment environments.
+
+Publishing a REST API specification may allow independent third-party server implementations. Such implementations remain independently maintained and are not required to share Restling Server's internal architecture or persistence model. Detailed interoperability and synchronization contracts will be specified when the relevant capabilities are implemented.
 
 ## 12. Error handling and observability
 
@@ -220,9 +225,24 @@ A separately documented, published API/protocol for third-party servers may be c
 
 ## 14. Delivery and deployment boundaries
 
-The first deployment model is **one centrally hosted multi-user application** with PostgreSQL. The document does not require microservices, message brokers, caches, separate worker services, or a particular hosting provider.
+Restling Server supports centrally hosted and privately self-hosted deployments. Both use the same feature-oriented modular monolith, FastAPI application, PostgreSQL database, and REST API contracts.
 
-Configuration is environment-specific and secrets are supplied outside source control. Migrations run as a controlled step before dependent application code is activated. Add background jobs or external infrastructure only when a defined feature requires them.
+Deployment location does not change server-side identity, authentication, authorization, or resource ownership semantics.
+
+Private self-hosted installations must support operation without SMTP. When email delivery is unavailable, authorized system administrators can use the agreed manual invitation and password-recovery workflows.
+
+The first system administrator is provisioned through a secure, server-side interactive CLI bootstrap. Public self-registration
+and web-based administrator bootstrap are not part of RS-003.
+
+Configuration is deployment-specific, with secrets supplied outside source control. Production deployments require secure transport, validated security configuration, and trusted public URLs for credential-bearing links.
+
+Database migrations run as controlled deployment steps before application code depending on those migrations is activated.
+
+Authentication and session state must survive ordinary application restarts. Scheduled authentication-data cleanup is performed through a dedicated CLI operation invoked by an external scheduler.
+
+The architecture does not require microservices, message brokers, Redis, a particular hosting provider, or a particular container orchestration system. Deployment topology, worker counts, connection pool sizing, and monitoring infrastructure remain operational decisions.
+
+Restling Desktop's local SQLite mode is an independent implementation and is not a deployment mode of Restling Server. It shares resource concepts and semantics where applicable, without inheriting server authentication and account-management machinery.
 
 ## 15. Incremental implementation sequence
 
@@ -237,7 +257,11 @@ Each increment adds only the packages and abstractions it needs, tests the relev
 
 ## 16. Open decisions and change control
 
-The following are **not settled by this architecture baseline**:
+The initial architecture baseline predates the detailed RS-003 design agreements. Identity, authentication, session management, recovery, security auditing, and deployment safeguards have since been designed in the RS-003 discussion reference.
+
+Those agreed decisions govern the proposed RS-003 implementation subject to reconciliation with the authoritative repository documents. Implementation details explicitly marked as open in the RS-003 reference remain undecided.
+
+Broader project-role and capability management, resource ownership, environment resolution, and synchronization design remain separate future implementation concerns.
 
 - Authentication protocol, password hashing library, recovery and verification flows.
 - Initial system and project roles are defined in `docs/architecture/USER_ROLE_MANAGEMENT.md`; exact capability details, project ownership cardinality, invitation lifecycle, and account/session workflows remain open.
