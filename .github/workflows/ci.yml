@@ -16,6 +16,28 @@ jobs:
     name: Python Quality Checks
     runs-on: ubuntu-latest
 
+    env:
+      POSTGRES_USER: restling
+      POSTGRES_PASSWORD: ci-only-password
+      POSTGRES_DB: restling_dev
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: restling
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: restling_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U restling -d restling_dev"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,5 +51,32 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      - name: Create test database
+        run: |
+          uv run python - <<'PY'
+          from sqlalchemy import text
+
+          from restling_server.core.config import Settings
+          from restling_server.core.database import create_database_engine
+
+          engine = create_database_engine(Settings())
+
+          try:
+              with engine.connect().execution_options(
+                  isolation_level="AUTOCOMMIT"
+              ) as connection:
+                  connection.execute(
+                      text("CREATE DATABASE restling_test")
+                  )
+          finally:
+              engine.dispose()
+          PY
+
+      - name: Apply test database migrations
+        env:
+          POSTGRES_DB: restling_test
+        run: uv run alembic upgrade head
+
       - name: Run quality checks
         run: make check
+
