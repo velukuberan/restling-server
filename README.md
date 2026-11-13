@@ -20,7 +20,11 @@ make run
 ```
 
 The committed uv.lock file ensures reproducible dependency installation. Update and commit it whenever project dependencies change.
-The development API runs at `http://127.0.0.1:8000`, with a basic process health check at `/health` and the generated OpenAPI documentation at `/docs`. Database integration is not yet implemented.
+The development API runs at `http://127.0.0.1:8000`, with a basic process health check at `/health` and the generated OpenAPI documentation at `/docs`.
+
+PostgreSQL-backed user management and database migrations
+are implemented. Projects, collections, environments,
+and synchronization remain future development milestones.
 
 ## Development Commands
 
