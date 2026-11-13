@@ -151,6 +151,7 @@ def create_user(
                 actor is None
                 or actor.system_role != "administrator"
                 or actor.status != "active"
+                or actor.password_reset_required
             ):
                 raise UserCreationNotAllowedError(
                     "Administrator privileges are required."
@@ -202,6 +203,7 @@ def issue_activation_token(
             actor is None
             or actor.system_role != "administrator"
             or actor.status != "active"
+            or actor.password_reset_required
         ):
             raise InvitationNotAllowedError("Administrator privileges are required.")
 

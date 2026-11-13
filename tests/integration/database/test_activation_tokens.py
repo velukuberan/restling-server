@@ -138,12 +138,18 @@ def test_activation_token_issuance_and_replacement(
 
 
 @pytest.mark.parametrize(
-    ("actor_role", "actor_status", "target_status"),
+    (
+        "actor_role",
+        "actor_status",
+        "target_status",
+        "password_reset_required",
+    ),
     [
-        ("user", "active", "pending"),
-        ("administrator", "suspended", "pending"),
-        ("administrator", "active", "active"),
-        ("administrator", "active", "suspended"),
+        ("user", "active", "pending", False),
+        ("administrator", "suspended", "pending", False),
+        ("administrator", "active", "active", False),
+        ("administrator", "active", "suspended", False),
+        ("administrator", "active", "pending", True),
     ],
 )
 def test_activation_token_requires_authorized_pending_account(
@@ -151,6 +157,7 @@ def test_activation_token_requires_authorized_pending_account(
     actor_role: str,
     actor_status: str,
     target_status: str,
+    password_reset_required: bool,
 ) -> None:
     """Reject unauthorized actors and ineligible target accounts."""
     test_id = uuid7().hex
@@ -166,6 +173,7 @@ def test_activation_token_requires_authorized_pending_account(
                 system_role=actor_role,
                 status=actor_status,
                 password_hash="test-password-hash",
+                password_reset_required=password_reset_required,
             )
 
             target = User(

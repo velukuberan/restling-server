@@ -482,3 +482,55 @@ def test_concurrent_duplicate_user_creation(
             connection.execute(
                 delete(User).where(User.normalized_email.in_([admin_email, user_email]))
             )
+
+
+def test_password_reset_required_administrator_cannot_create_user(
+    test_engine: Engine,
+) -> None:
+    """An administrator requiring a password reset cannot create users."""
+    test_id = uuid7().hex
+    admin_email = f"reset-required-admin-{test_id}@example.com"
+    attempted_email = f"reset-required-user-{test_id}@example.com"
+
+    try:
+        with Session(test_engine) as session:
+            administrator = User(
+                email=admin_email,
+                normalized_email=admin_email,
+                display_name="Administrator",
+                status="active",
+                system_role="administrator",
+                password_hash="test-password-hash",
+                password_reset_required=True,
+            )
+
+            session.add(administrator)
+            session.commit()
+            administrator_id = administrator.id
+
+        with Session(test_engine) as session:
+            with pytest.raises(
+                UserCreationNotAllowedError,
+                match="Administrator privileges are required",
+            ):
+                create_user(
+                    session,
+                    actor_id=administrator_id,
+                    email=attempted_email,
+                    display_name="Unauthorized User",
+                )
+
+        with Session(test_engine) as session:
+            attempted_user = session.scalar(
+                select(User).where(User.normalized_email == attempted_email)
+            )
+
+            assert attempted_user is None
+
+    finally:
+        with test_engine.begin() as connection:
+            connection.execute(
+                delete(User).where(
+                    User.normalized_email.in_([admin_email, attempted_email])
+                )
+            )
