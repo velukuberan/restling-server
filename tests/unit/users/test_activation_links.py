@@ -12,17 +12,15 @@ from restling_server.users.activation_links import (
 
 
 def make_settings(public_url: str | None = None) -> Settings:
-    """Create configuration with optional trusted public URL."""
-    values: dict[str, object] = {
-        "postgres_user": "test_user",
-        "postgres_password": "test_password",
-        "postgres_db": "test_db",
-    }
-
-    if public_url is not None:
-        values["RESTLING_PUBLIC_URL"] = public_url
-
-    return Settings.model_validate(values)
+    """Create settings with an explicitly configured public URL."""
+    return Settings.model_validate(
+        {
+            "postgres_user": "test_user",
+            "postgres_password": "test_password",
+            "postgres_db": "test_db",
+            "RESTLING_PUBLIC_URL": public_url,
+        }
+    )
 
 
 @pytest.mark.parametrize(

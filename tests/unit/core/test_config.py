@@ -10,13 +10,19 @@ def make_settings(
     public_url: str,
     **overrides: object,
 ) -> Settings:
-    """Build settings without depending on local environment files."""
+    """Build settings with explicit test defaults."""
     return Settings.model_validate(
         {
             "postgres_user": "test_user",
             "postgres_password": "test_password",
             "postgres_db": "test_db",
             "RESTLING_PUBLIC_URL": public_url,
+            "RESTLING_SMTP_HOST": None,
+            "RESTLING_SMTP_PORT": 587,
+            "RESTLING_SMTP_SECURITY": "starttls",
+            "RESTLING_SMTP_USERNAME": None,
+            "RESTLING_SMTP_PASSWORD": None,
+            "RESTLING_SMTP_FROM_EMAIL": None,
             **overrides,
         }
     )

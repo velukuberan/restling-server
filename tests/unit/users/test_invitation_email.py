@@ -15,12 +15,18 @@ from restling_server.users.invitation_email import (
 
 
 def make_settings(**overrides: object) -> Settings:
-    """Create validated SMTP settings for tests."""
+    """Create SMTP settings independent of local SMTP configuration."""
     return Settings.model_validate(
         {
             "postgres_user": "test_user",
             "postgres_password": "test_password",
             "postgres_db": "test_db",
+            "RESTLING_SMTP_HOST": None,
+            "RESTLING_SMTP_PORT": 587,
+            "RESTLING_SMTP_SECURITY": "starttls",
+            "RESTLING_SMTP_USERNAME": None,
+            "RESTLING_SMTP_PASSWORD": None,
+            "RESTLING_SMTP_FROM_EMAIL": None,
             **overrides,
         }
     )
