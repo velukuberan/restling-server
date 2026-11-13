@@ -1,6 +1,6 @@
 """Application operations for user management."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from email_validator import EmailNotValidError, validate_email
@@ -9,8 +9,9 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from restling_server.users.models import User
+from restling_server.users.models import OneTimeToken, User
 from restling_server.users.passwords import hash_password, validate_password
+from restling_server.users.tokens import generate_token, hash_token
 
 # PostgreSQL advisory-lock identifiers reserved for administrator bootstrap.
 _BOOTSTRAP_LOCK_NAMESPACE = 723941
@@ -19,6 +20,22 @@ _BOOTSTRAP_LOCK_ID = 1
 
 class AdministratorAlreadyInitializedError(Exception):
     """Initial administrator bootstrap is no longer permitted."""
+
+
+class UserCreationNotAllowedError(Exception):
+    """The actor cannot create user accounts."""
+
+
+class UserAlreadyExistsError(Exception):
+    """A user account with this email already exists."""
+
+
+class InvitationNotAllowedError(Exception):
+    """The invitation cannot be issued for this actor or account."""
+
+
+class InvalidActivationTokenError(Exception):
+    """The activation credential is invalid or no longer usable."""
 
 
 def bootstrap_administrator(
@@ -86,14 +103,6 @@ def bootstrap_administrator(
     return administrator
 
 
-class UserCreationNotAllowedError(Exception):
-    """The actor cannot create user accounts."""
-
-
-class UserAlreadyExistsError(Exception):
-    """A user account with this email already exists."""
-
-
 def create_user(
     session: Session,
     *,
@@ -142,6 +151,7 @@ def create_user(
                 actor is None
                 or actor.system_role != "administrator"
                 or actor.status != "active"
+                or actor.password_reset_required
             ):
                 raise UserCreationNotAllowedError(
                     "Administrator privileges are required."
@@ -173,3 +183,135 @@ def create_user(
         raise
 
     return user
+
+
+def issue_activation_token(
+    session: Session,
+    *,
+    actor_id: UUID,
+    user_id: UUID,
+    expiry_hours: int,
+) -> tuple[str, datetime]:
+    """Issue or replace an activation token for a pending user."""
+    if expiry_hours < 1:
+        raise ValueError("Invitation expiry must be at least one hour.")
+
+    with session.begin():
+        actor = session.get(User, actor_id)
+
+        if (
+            actor is None
+            or actor.system_role != "administrator"
+            or actor.status != "active"
+            or actor.password_reset_required
+        ):
+            raise InvitationNotAllowedError("Administrator privileges are required.")
+
+        # Serialize issuance and replacement for this user.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None or user.status != "pending":
+            raise InvitationNotAllowedError("Account is not eligible for activation.")
+
+        now = datetime.now(UTC)
+
+        # Invalidate previous usable activation invitations.
+        existing_tokens = session.scalars(
+            select(OneTimeToken).where(
+                OneTimeToken.user_id == user_id,
+                OneTimeToken.purpose == "account_activation",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+        ).all()
+
+        for existing_token in existing_tokens:
+            existing_token.revoked_at = now
+
+        raw_token = generate_token()
+        expires_at = now + timedelta(hours=expiry_hours)
+
+        token = OneTimeToken(
+            user_id=user.id,
+            purpose="account_activation",
+            token_hash=hash_token(raw_token),
+            pending_email=None,
+            created_at=now,
+            expires_at=expires_at,
+        )
+
+        session.add(token)
+        session.flush()
+
+    return raw_token, expires_at
+
+
+def activate_user(
+    session: Session,
+    *,
+    token: str,
+    password: str,
+) -> None:
+    """Activate a pending user with a valid one-time credential."""
+
+    token_digest = hash_token(token)
+
+    with session.begin():
+        # Look up the credential without locking the token row yet.
+        token_user_id = session.scalar(
+            select(OneTimeToken.user_id).where(
+                OneTimeToken.token_hash == token_digest,
+                OneTimeToken.purpose == "account_activation",
+            )
+        )
+
+        if token_user_id is None:
+            raise InvalidActivationTokenError(
+                "Invalid or expired activation credential."
+            )
+
+        # Lock the user first, matching invitation issuance lock order.
+        user = session.scalar(
+            select(User).where(User.id == token_user_id).with_for_update()
+        )
+
+        if user is None or user.status != "pending":
+            raise InvalidActivationTokenError(
+                "Invalid or expired activation credential."
+            )
+
+        # Re-read and lock the token after acquiring the user lock.
+        # It may have been revoked by another transaction meanwhile.
+        stored_token = session.scalar(
+            select(OneTimeToken)
+            .where(
+                OneTimeToken.token_hash == token_digest,
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose == "account_activation",
+            )
+            .with_for_update()
+        )
+
+        now = datetime.now(UTC)
+
+        if (
+            stored_token is None
+            or stored_token.expires_at <= now
+            or stored_token.consumed_at is not None
+            or stored_token.revoked_at is not None
+        ):
+            raise InvalidActivationTokenError(
+                "Invalid or expired activation credential."
+            )
+
+        # Validate the password only after confirming the token is usable.
+        validate_password(password)
+
+        user.password_hash = hash_password(password)
+        user.password_reset_required = False
+        user.status = "active"
+        user.activated_at = now
+
+        stored_token.consumed_at = now
+
+        session.flush()
