@@ -204,3 +204,198 @@ class OneTimeToken(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+
+class LoginSession(Base):
+    """A login session with one current refresh credential."""
+
+    __tablename__ = "sessions"
+
+    __table_args__ = (
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_sessions_expiry",
+        ),
+        CheckConstraint(
+            """
+            revoked_at IS NULL
+            OR (
+                refresh_token_hash IS NULL
+                AND revocation_reason IS NOT NULL
+                AND LENGTH(TRIM(revocation_reason)) > 0
+            )
+            """,
+            name="ck_sessions_revocation",
+        ),
+        CheckConstraint(
+            """
+            refresh_token_hash IS NULL
+            OR LENGTH(TRIM(refresh_token_hash)) > 0
+            """,
+            name="ck_sessions_refresh_hash_not_empty",
+        ),
+        UniqueConstraint(
+            "refresh_token_hash",
+            name="sessions_refresh_token_hash_key",
+        ),
+        Index("ix_sessions_user_id", "user_id"),
+        Index("ix_sessions_expires_at", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        primary_key=True,
+        default=uuid7,
+    )
+
+    user_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+
+    refresh_token_hash: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
+
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    revocation_reason: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+
+    login_ip: Mapped[str | None] = mapped_column(
+        String(45),
+        nullable=True,
+    )
+
+    last_seen_ip: Mapped[str | None] = mapped_column(
+        String(45),
+        nullable=True,
+    )
+
+    machine_name: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+
+class AccessToken(Base):
+    """An opaque access credential associated with a login session."""
+
+    __tablename__ = "access_tokens"
+
+    __table_args__ = (
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_access_tokens_expiry",
+        ),
+        CheckConstraint(
+            "LENGTH(TRIM(token_hash)) > 0",
+            name="ck_access_tokens_hash_not_empty",
+        ),
+        UniqueConstraint(
+            "token_hash",
+            name="access_tokens_token_hash_key",
+        ),
+        Index("ix_access_tokens_expires_at", "expires_at"),
+        Index("ix_access_tokens_session_id", "session_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        primary_key=True,
+        default=uuid7,
+    )
+
+    session_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    token_hash: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
+
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    issued_ip: Mapped[str | None] = mapped_column(
+        String(45),
+        nullable=True,
+    )
+
+
+class RefreshTokenHistory(Base):
+    """A consumed refresh credential retained for replay detection."""
+
+    __tablename__ = "refresh_token_history"
+
+    __table_args__ = (
+        CheckConstraint(
+            "LENGTH(TRIM(token_hash)) > 0",
+            name="ck_refresh_token_history_hash_not_empty",
+        ),
+        UniqueConstraint(
+            "token_hash",
+            name="refresh_token_history_token_hash_key",
+        ),
+        Index(
+            "ix_refresh_token_history_session_id",
+            "session_id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        primary_key=True,
+        default=uuid7,
+    )
+
+    session_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    token_hash: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    used_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
