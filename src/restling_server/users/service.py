@@ -610,3 +610,45 @@ def authenticate_access_token(
         raise InvalidCredentialsError("Invalid access credential.")
 
     return user
+
+
+def logout_session(
+    session: Session,
+    *,
+    access_token: str,
+) -> None:
+    """Revoke the login session associated with an access token."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        now = datetime.now(UTC)
+
+        login_session = session.scalar(
+            select(LoginSession)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .join(
+                User,
+                User.id == LoginSession.user_id,
+            )
+            .where(
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+                User.status == "active",
+                User.password_reset_required.is_(False),
+            )
+            .with_for_update(of=LoginSession)
+        )
+
+        if login_session is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        login_session.refresh_token_hash = None
+        login_session.revoked_at = now
+        login_session.revocation_reason = "logout"
+
+        session.flush()
