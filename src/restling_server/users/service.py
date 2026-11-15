@@ -1,16 +1,27 @@
 """Application operations for user management."""
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from email_validator import EmailNotValidError, validate_email
 from psycopg.errors import UniqueViolation
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from restling_server.users.models import OneTimeToken, User
-from restling_server.users.passwords import hash_password, validate_password
+from restling_server.users.models import (
+    AccessToken,
+    LoginSession,
+    OneTimeToken,
+    RefreshTokenHistory,
+    User,
+)
+from restling_server.users.passwords import (
+    hash_password,
+    validate_password,
+    verify_password,
+)
 from restling_server.users.tokens import generate_token, hash_token
 
 # PostgreSQL advisory-lock identifiers reserved for administrator bootstrap.
@@ -36,6 +47,39 @@ class InvitationNotAllowedError(Exception):
 
 class InvalidActivationTokenError(Exception):
     """The activation credential is invalid or no longer usable."""
+
+
+class InvalidCredentialsError(Exception):
+    """The supplied login credentials are invalid."""
+
+
+class SessionLimitReachedError(Exception):
+    """The account has reached its active-session limit."""
+
+
+@dataclass(frozen=True)
+class LoginResult:
+    """Credentials and session details returned by successful login."""
+
+    session_id: UUID
+    access_token: str
+    refresh_token: str
+    access_token_expires_at: datetime
+    session_expires_at: datetime
+
+
+@dataclass(frozen=True)
+class SessionSummary:
+    """Safe metadata describing an active login session."""
+
+    session_id: UUID
+    created_at: datetime
+    expires_at: datetime
+    last_used_at: datetime | None
+    login_ip: str | None
+    last_seen_ip: str | None
+    machine_name: str | None
+    is_current: bool
 
 
 def bootstrap_administrator(
@@ -315,3 +359,522 @@ def activate_user(
         stored_token.consumed_at = now
 
         session.flush()
+
+
+def login_user(
+    session: Session,
+    *,
+    email: str,
+    password: str,
+    access_token_expiry_minutes: int,
+    refresh_session_expiry_days: int,
+    max_active_sessions: int,
+) -> LoginResult:
+    """Authenticate a user and create an opaque-token login session."""
+    if (
+        access_token_expiry_minutes < 1
+        or refresh_session_expiry_days < 1
+        or max_active_sessions < 1
+    ):
+        raise ValueError("Authentication settings must be positive.")
+
+    try:
+        validated_email = validate_email(
+            email.strip(),
+            check_deliverability=False,
+        )
+    except EmailNotValidError as exc:
+        raise InvalidCredentialsError("Invalid email address or password.") from exc
+
+    normalized_email = validated_email.normalized.casefold()
+
+    with session.begin():
+        user = session.scalar(
+            select(User)
+            .where(User.normalized_email == normalized_email)
+            .with_for_update()
+        )
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid email address or password.")
+
+        if user.password_hash is None or not verify_password(
+            password, user.password_hash
+        ):
+            raise InvalidCredentialsError("Invalid email address or password.")
+
+        if user.status != "active" or user.password_reset_required:
+            raise InvalidCredentialsError("Invalid email address or password.")
+
+        now = datetime.now(UTC)
+
+        active_session_count = session.scalar(
+            select(func.count(LoginSession.id)).where(
+                LoginSession.user_id == user.id,
+                LoginSession.revoked_at.is_(None),
+                LoginSession.expires_at > now,
+            )
+        )
+
+        if active_session_count is None:
+            active_session_count = 0
+
+        if active_session_count >= max_active_sessions:
+            raise SessionLimitReachedError("Maximum active sessions reached.")
+
+        raw_access_token = generate_token()
+        raw_refresh_token = generate_token()
+
+        session_expires_at = now + timedelta(days=refresh_session_expiry_days)
+
+        access_token_expires_at = min(
+            now + timedelta(minutes=access_token_expiry_minutes),
+            session_expires_at,
+        )
+
+        login_session = LoginSession(
+            user_id=user.id,
+            refresh_token_hash=hash_token(raw_refresh_token),
+            created_at=now,
+            expires_at=session_expires_at,
+        )
+
+        session.add(login_session)
+        session.flush()
+
+        access_token = AccessToken(
+            session_id=login_session.id,
+            token_hash=hash_token(raw_access_token),
+            created_at=now,
+            expires_at=access_token_expires_at,
+        )
+
+        session.add(access_token)
+        session.flush()
+
+        result = LoginResult(
+            session_id=login_session.id,
+            access_token=raw_access_token,
+            refresh_token=raw_refresh_token,
+            access_token_expires_at=access_token_expires_at,
+            session_expires_at=session_expires_at,
+        )
+
+    return result
+
+
+def refresh_session(
+    session: Session,
+    *,
+    refresh_token: str,
+    access_token_expiry_minutes: int,
+) -> LoginResult:
+    """Rotate refresh credentials and revoke sessions on replay."""
+    if access_token_expiry_minutes < 1:
+        raise ValueError("Access-token expiry must be positive.")
+
+    token_digest = hash_token(refresh_token)
+    replay_detected = False
+    result: LoginResult | None = None
+
+    with session.begin():
+        # A credential may be current or already consumed.
+        session_user_id = session.scalar(
+            select(LoginSession.user_id).where(
+                LoginSession.refresh_token_hash == token_digest
+            )
+        )
+
+        if session_user_id is None:
+            session_user_id = session.scalar(
+                select(LoginSession.user_id)
+                .join(
+                    RefreshTokenHistory,
+                    RefreshTokenHistory.session_id == LoginSession.id,
+                )
+                .where(RefreshTokenHistory.token_hash == token_digest)
+            )
+
+        if session_user_id is None:
+            raise InvalidCredentialsError("Invalid refresh credential.")
+
+        # Lock the user first, consistent with login and other operations.
+        user = session.scalar(
+            select(User).where(User.id == session_user_id).with_for_update()
+        )
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid refresh credential.")
+
+        # Re-read history after acquiring the user lock.
+        # A concurrent refresh may have consumed this token meanwhile.
+        consumed_token = session.scalar(
+            select(RefreshTokenHistory).where(
+                RefreshTokenHistory.token_hash == token_digest
+            )
+        )
+
+        if consumed_token is not None:
+            login_session = session.scalar(
+                select(LoginSession)
+                .where(LoginSession.id == consumed_token.session_id)
+                .with_for_update()
+            )
+
+            if login_session is not None:
+                if login_session.revoked_at is None:
+                    login_session.refresh_token_hash = None
+                    login_session.revoked_at = datetime.now(UTC)
+                    login_session.revocation_reason = "refresh_token_replay"
+
+                replay_detected = True
+
+        else:
+            login_session = session.scalar(
+                select(LoginSession)
+                .where(
+                    LoginSession.user_id == user.id,
+                    LoginSession.refresh_token_hash == token_digest,
+                )
+                .with_for_update()
+            )
+
+            now = datetime.now(UTC)
+
+            if (
+                login_session is None
+                or login_session.revoked_at is not None
+                or login_session.expires_at <= now
+                or user.status != "active"
+                or user.password_reset_required
+            ):
+                raise InvalidCredentialsError("Invalid refresh credential.")
+
+            raw_access_token = generate_token()
+            raw_refresh_token = generate_token()
+
+            access_token_expires_at = min(
+                now + timedelta(minutes=access_token_expiry_minutes),
+                login_session.expires_at,
+            )
+
+            previous_token = RefreshTokenHistory(
+                session_id=login_session.id,
+                token_hash=token_digest,
+                used_at=now,
+            )
+
+            login_session.refresh_token_hash = hash_token(raw_refresh_token)
+            login_session.last_used_at = now
+
+            access_token = AccessToken(
+                session_id=login_session.id,
+                token_hash=hash_token(raw_access_token),
+                created_at=now,
+                expires_at=access_token_expires_at,
+            )
+
+            session.add(previous_token)
+            session.add(access_token)
+
+            result = LoginResult(
+                session_id=login_session.id,
+                access_token=raw_access_token,
+                refresh_token=raw_refresh_token,
+                access_token_expires_at=access_token_expires_at,
+                session_expires_at=login_session.expires_at,
+            )
+
+        session.flush()
+
+    # The transaction has committed before reporting a replay.
+    if replay_detected:
+        raise InvalidCredentialsError("Invalid refresh credential.")
+
+    if result is None:
+        raise InvalidCredentialsError("Invalid refresh credential.")
+
+    return result
+
+
+def authenticate_access_token(
+    session: Session,
+    *,
+    access_token: str,
+) -> User:
+    """Resolve an eligible user from a valid opaque access token."""
+    token_digest = hash_token(access_token)
+    now = datetime.now(UTC)
+
+    user = session.scalar(
+        select(User)
+        .join(LoginSession, LoginSession.user_id == User.id)
+        .join(AccessToken, AccessToken.session_id == LoginSession.id)
+        .where(
+            AccessToken.token_hash == token_digest,
+            AccessToken.expires_at > now,
+            LoginSession.expires_at > now,
+            LoginSession.revoked_at.is_(None),
+            User.status == "active",
+            User.password_reset_required.is_(False),
+        )
+    )
+
+    if user is None:
+        raise InvalidCredentialsError("Invalid access credential.")
+
+    return user
+
+
+def logout_session(
+    session: Session,
+    *,
+    access_token: str,
+) -> None:
+    """Revoke the login session associated with an access token."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        now = datetime.now(UTC)
+
+        login_session = session.scalar(
+            select(LoginSession)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .join(
+                User,
+                User.id == LoginSession.user_id,
+            )
+            .where(
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+                User.status == "active",
+                User.password_reset_required.is_(False),
+            )
+            .with_for_update(of=LoginSession)
+        )
+
+        if login_session is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        login_session.refresh_token_hash = None
+        login_session.revoked_at = now
+        login_session.revocation_reason = "logout"
+
+        session.flush()
+
+
+def list_user_sessions(
+    session: Session,
+    *,
+    access_token: str,
+) -> list[SessionSummary]:
+    """List active sessions owned by the authenticated user."""
+    token_digest = hash_token(access_token)
+    now = datetime.now(UTC)
+
+    current = session.execute(
+        select(LoginSession.id, LoginSession.user_id)
+        .join(
+            AccessToken,
+            AccessToken.session_id == LoginSession.id,
+        )
+        .join(
+            User,
+            User.id == LoginSession.user_id,
+        )
+        .where(
+            AccessToken.token_hash == token_digest,
+            AccessToken.expires_at > now,
+            LoginSession.expires_at > now,
+            LoginSession.revoked_at.is_(None),
+            User.status == "active",
+            User.password_reset_required.is_(False),
+        )
+    ).one_or_none()
+
+    if current is None:
+        raise InvalidCredentialsError("Invalid access credential.")
+
+    current_session_id, user_id = current
+
+    active_sessions = session.scalars(
+        select(LoginSession)
+        .where(
+            LoginSession.user_id == user_id,
+            LoginSession.revoked_at.is_(None),
+            LoginSession.expires_at > now,
+        )
+        .order_by(LoginSession.created_at.desc(), LoginSession.id)
+    ).all()
+
+    return [
+        SessionSummary(
+            session_id=item.id,
+            created_at=item.created_at,
+            expires_at=item.expires_at,
+            last_used_at=item.last_used_at,
+            login_ip=item.login_ip,
+            last_seen_ip=item.last_seen_ip,
+            machine_name=item.machine_name,
+            is_current=item.id == current_session_id,
+        )
+        for item in active_sessions
+    ]
+
+
+def revoke_user_session(
+    session: Session,
+    *,
+    access_token: str,
+    target_session_id: UUID,
+) -> None:
+    """Revoke a session owned by the authenticated user."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        # Identify the account associated with the access credential.
+        user_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if user_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Serialize account-level session operations.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate the credential after acquiring the user lock.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or user.status != "active"
+            or user.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Ownership is enforced as part of the database query.
+        target = session.scalar(
+            select(LoginSession)
+            .where(
+                LoginSession.id == target_session_id,
+                LoginSession.user_id == user.id,
+                LoginSession.revoked_at.is_(None),
+                LoginSession.expires_at > now,
+            )
+            .with_for_update()
+        )
+
+        if target is None:
+            raise InvalidCredentialsError("Session not found or not available.")
+
+        target.refresh_token_hash = None
+        target.revoked_at = now
+        target.revocation_reason = "user_revoked"
+
+        session.flush()
+
+
+def revoke_other_sessions(
+    session: Session,
+    *,
+    access_token: str,
+) -> int:
+    """Revoke all other active sessions owned by the authenticated user."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        # Identify the owner of the supplied access credential.
+        user_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if user_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Serialize operations affecting this user's sessions.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate authentication after acquiring the user lock.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or user.status != "active"
+            or user.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Select only active sessions owned by this user,
+        # explicitly excluding the current session.
+        other_sessions = session.scalars(
+            select(LoginSession)
+            .where(
+                LoginSession.user_id == user.id,
+                LoginSession.id != current_session_id,
+                LoginSession.revoked_at.is_(None),
+                LoginSession.expires_at > now,
+            )
+            .order_by(LoginSession.id)
+            .with_for_update()
+        ).all()
+
+        for other in other_sessions:
+            other.refresh_token_hash = None
+            other.revoked_at = now
+            other.revocation_reason = "user_revoked"
+
+        session.flush()
+
+        return len(other_sessions)
