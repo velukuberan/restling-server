@@ -107,6 +107,23 @@ Unencrypted SMTP is permitted only for local loopback
 connections. Production SMTP connections must use
 STARTTLS or TLS.
 
+### Authentication configuration
+
+Restling Server supports configurable token lifetimes and
+concurrent session limits:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `RESTLING_ACCESS_TOKEN_EXPIRY_MINUTES` | `15` | Access-token lifetime in minutes |
+| `RESTLING_REFRESH_SESSION_EXPIRY_DAYS` | `7` | Absolute refresh-session lifetime in days |
+| `RESTLING_MAX_ACTIVE_SESSIONS` | `2` | Maximum concurrent active sessions per user |
+
+All three settings must be positive integers.
+
+These settings are currently available in configuration.
+Login, token issuance, refresh, and session management
+endpoints are not yet implemented.
+
 ### Security and operational safeguards
 
 - Run the administrator CLI only in a trusted server environment.

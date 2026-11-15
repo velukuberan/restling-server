@@ -34,6 +34,25 @@ class Settings(BaseSettings):
         validation_alias="RESTLING_INVITATION_EXPIRY_HOURS",
     )
 
+    # Opaque authentication tokens and active-session limits.
+    access_token_expiry_minutes: int = Field(
+        default=15,
+        ge=1,
+        validation_alias="RESTLING_ACCESS_TOKEN_EXPIRY_MINUTES",
+    )
+
+    refresh_session_expiry_days: int = Field(
+        default=7,
+        ge=1,
+        validation_alias="RESTLING_REFRESH_SESSION_EXPIRY_DAYS",
+    )
+
+    max_active_sessions: int = Field(
+        default=2,
+        ge=1,
+        validation_alias="RESTLING_MAX_ACTIVE_SESSIONS",
+    )
+
     public_url: AnyHttpUrl | None = Field(
         default=None,
         validation_alias="RESTLING_PUBLIC_URL",

@@ -205,3 +205,44 @@ def test_unencrypted_smtp_with_credentials_is_rejected() -> None:
             RESTLING_SMTP_USERNAME="restling",
             RESTLING_SMTP_PASSWORD="test-password",
         )
+
+
+def test_authentication_settings_have_secure_defaults() -> None:
+    settings = make_settings("http://localhost:8000")
+
+    assert settings.access_token_expiry_minutes == 15
+    assert settings.refresh_session_expiry_days == 7
+    assert settings.max_active_sessions == 2
+
+
+def test_authentication_settings_are_configurable() -> None:
+    settings = make_settings(
+        "http://localhost:8000",
+        RESTLING_ACCESS_TOKEN_EXPIRY_MINUTES=30,
+        RESTLING_REFRESH_SESSION_EXPIRY_DAYS=14,
+        RESTLING_MAX_ACTIVE_SESSIONS=5,
+    )
+
+    assert settings.access_token_expiry_minutes == 30
+    assert settings.refresh_session_expiry_days == 14
+    assert settings.max_active_sessions == 5
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "RESTLING_ACCESS_TOKEN_EXPIRY_MINUTES",
+        "RESTLING_REFRESH_SESSION_EXPIRY_DAYS",
+        "RESTLING_MAX_ACTIVE_SESSIONS",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", [0, -1])
+def test_authentication_settings_reject_nonpositive_values(
+    setting: str,
+    invalid_value: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        make_settings(
+            "http://localhost:8000",
+            **{setting: invalid_value},
+        )
