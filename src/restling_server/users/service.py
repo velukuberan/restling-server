@@ -1,16 +1,26 @@
 """Application operations for user management."""
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from email_validator import EmailNotValidError, validate_email
 from psycopg.errors import UniqueViolation
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from restling_server.users.models import OneTimeToken, User
-from restling_server.users.passwords import hash_password, validate_password
+from restling_server.users.models import (
+    AccessToken,
+    LoginSession,
+    OneTimeToken,
+    User,
+)
+from restling_server.users.passwords import (
+    hash_password,
+    validate_password,
+    verify_password,
+)
 from restling_server.users.tokens import generate_token, hash_token
 
 # PostgreSQL advisory-lock identifiers reserved for administrator bootstrap.
@@ -36,6 +46,25 @@ class InvitationNotAllowedError(Exception):
 
 class InvalidActivationTokenError(Exception):
     """The activation credential is invalid or no longer usable."""
+
+
+class InvalidCredentialsError(Exception):
+    """The supplied login credentials are invalid."""
+
+
+class SessionLimitReachedError(Exception):
+    """The account has reached its active-session limit."""
+
+
+@dataclass(frozen=True)
+class LoginResult:
+    """Credentials and session details returned by successful login."""
+
+    session_id: UUID
+    access_token: str
+    refresh_token: str
+    access_token_expires_at: datetime
+    session_expires_at: datetime
 
 
 def bootstrap_administrator(
@@ -315,3 +344,105 @@ def activate_user(
         stored_token.consumed_at = now
 
         session.flush()
+
+
+def login_user(
+    session: Session,
+    *,
+    email: str,
+    password: str,
+    access_token_expiry_minutes: int,
+    refresh_session_expiry_days: int,
+    max_active_sessions: int,
+) -> LoginResult:
+    """Authenticate a user and create an opaque-token login session."""
+    if (
+        access_token_expiry_minutes < 1
+        or refresh_session_expiry_days < 1
+        or max_active_sessions < 1
+    ):
+        raise ValueError("Authentication settings must be positive.")
+
+    try:
+        validated_email = validate_email(
+            email.strip(),
+            check_deliverability=False,
+        )
+    except EmailNotValidError as exc:
+        raise InvalidCredentialsError("Invalid email address or password.") from exc
+
+    normalized_email = validated_email.normalized.casefold()
+
+    with session.begin():
+        user = session.scalar(
+            select(User)
+            .where(User.normalized_email == normalized_email)
+            .with_for_update()
+        )
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid email address or password.")
+
+        if user.password_hash is None or not verify_password(
+            password, user.password_hash
+        ):
+            raise InvalidCredentialsError("Invalid email address or password.")
+
+        if user.status != "active" or user.password_reset_required:
+            raise InvalidCredentialsError("Invalid email address or password.")
+
+        now = datetime.now(UTC)
+
+        active_session_count = session.scalar(
+            select(func.count(LoginSession.id)).where(
+                LoginSession.user_id == user.id,
+                LoginSession.revoked_at.is_(None),
+                LoginSession.expires_at > now,
+            )
+        )
+
+        if active_session_count is None:
+            active_session_count = 0
+
+        if active_session_count >= max_active_sessions:
+            raise SessionLimitReachedError("Maximum active sessions reached.")
+
+        raw_access_token = generate_token()
+        raw_refresh_token = generate_token()
+
+        session_expires_at = now + timedelta(days=refresh_session_expiry_days)
+
+        access_token_expires_at = min(
+            now + timedelta(minutes=access_token_expiry_minutes),
+            session_expires_at,
+        )
+
+        login_session = LoginSession(
+            user_id=user.id,
+            refresh_token_hash=hash_token(raw_refresh_token),
+            created_at=now,
+            expires_at=session_expires_at,
+        )
+
+        session.add(login_session)
+        session.flush()
+
+        access_token = AccessToken(
+            session_id=login_session.id,
+            token_hash=hash_token(raw_access_token),
+            created_at=now,
+            expires_at=access_token_expires_at,
+        )
+
+        session.add(access_token)
+        session.flush()
+
+        result = LoginResult(
+            session_id=login_session.id,
+            access_token=raw_access_token,
+            refresh_token=raw_refresh_token,
+            access_token_expires_at=access_token_expires_at,
+            session_expires_at=session_expires_at,
+        )
+
+    return result
