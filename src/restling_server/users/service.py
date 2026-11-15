@@ -68,6 +68,20 @@ class LoginResult:
     session_expires_at: datetime
 
 
+@dataclass(frozen=True)
+class SessionSummary:
+    """Safe metadata describing an active login session."""
+
+    session_id: UUID
+    created_at: datetime
+    expires_at: datetime
+    last_used_at: datetime | None
+    login_ip: str | None
+    last_seen_ip: str | None
+    machine_name: str | None
+    is_current: bool
+
+
 def bootstrap_administrator(
     session: Session,
     *,
@@ -652,3 +666,215 @@ def logout_session(
         login_session.revocation_reason = "logout"
 
         session.flush()
+
+
+def list_user_sessions(
+    session: Session,
+    *,
+    access_token: str,
+) -> list[SessionSummary]:
+    """List active sessions owned by the authenticated user."""
+    token_digest = hash_token(access_token)
+    now = datetime.now(UTC)
+
+    current = session.execute(
+        select(LoginSession.id, LoginSession.user_id)
+        .join(
+            AccessToken,
+            AccessToken.session_id == LoginSession.id,
+        )
+        .join(
+            User,
+            User.id == LoginSession.user_id,
+        )
+        .where(
+            AccessToken.token_hash == token_digest,
+            AccessToken.expires_at > now,
+            LoginSession.expires_at > now,
+            LoginSession.revoked_at.is_(None),
+            User.status == "active",
+            User.password_reset_required.is_(False),
+        )
+    ).one_or_none()
+
+    if current is None:
+        raise InvalidCredentialsError("Invalid access credential.")
+
+    current_session_id, user_id = current
+
+    active_sessions = session.scalars(
+        select(LoginSession)
+        .where(
+            LoginSession.user_id == user_id,
+            LoginSession.revoked_at.is_(None),
+            LoginSession.expires_at > now,
+        )
+        .order_by(LoginSession.created_at.desc(), LoginSession.id)
+    ).all()
+
+    return [
+        SessionSummary(
+            session_id=item.id,
+            created_at=item.created_at,
+            expires_at=item.expires_at,
+            last_used_at=item.last_used_at,
+            login_ip=item.login_ip,
+            last_seen_ip=item.last_seen_ip,
+            machine_name=item.machine_name,
+            is_current=item.id == current_session_id,
+        )
+        for item in active_sessions
+    ]
+
+
+def revoke_user_session(
+    session: Session,
+    *,
+    access_token: str,
+    target_session_id: UUID,
+) -> None:
+    """Revoke a session owned by the authenticated user."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        # Identify the account associated with the access credential.
+        user_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if user_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Serialize account-level session operations.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate the credential after acquiring the user lock.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or user.status != "active"
+            or user.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Ownership is enforced as part of the database query.
+        target = session.scalar(
+            select(LoginSession)
+            .where(
+                LoginSession.id == target_session_id,
+                LoginSession.user_id == user.id,
+                LoginSession.revoked_at.is_(None),
+                LoginSession.expires_at > now,
+            )
+            .with_for_update()
+        )
+
+        if target is None:
+            raise InvalidCredentialsError("Session not found or not available.")
+
+        target.refresh_token_hash = None
+        target.revoked_at = now
+        target.revocation_reason = "user_revoked"
+
+        session.flush()
+
+
+def revoke_other_sessions(
+    session: Session,
+    *,
+    access_token: str,
+) -> int:
+    """Revoke all other active sessions owned by the authenticated user."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        # Identify the owner of the supplied access credential.
+        user_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if user_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Serialize operations affecting this user's sessions.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate authentication after acquiring the user lock.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or user.status != "active"
+            or user.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Select only active sessions owned by this user,
+        # explicitly excluding the current session.
+        other_sessions = session.scalars(
+            select(LoginSession)
+            .where(
+                LoginSession.user_id == user.id,
+                LoginSession.id != current_session_id,
+                LoginSession.revoked_at.is_(None),
+                LoginSession.expires_at > now,
+            )
+            .order_by(LoginSession.id)
+            .with_for_update()
+        ).all()
+
+        for other in other_sessions:
+            other.refresh_token_hash = None
+            other.revoked_at = now
+            other.revocation_reason = "user_revoked"
+
+        session.flush()
+
+        return len(other_sessions)
