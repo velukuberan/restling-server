@@ -14,6 +14,7 @@ from restling_server.users.models import (
     AccessToken,
     LoginSession,
     OneTimeToken,
+    RefreshTokenHistory,
     User,
 )
 from restling_server.users.passwords import (
@@ -444,5 +445,139 @@ def login_user(
             access_token_expires_at=access_token_expires_at,
             session_expires_at=session_expires_at,
         )
+
+    return result
+
+
+def refresh_session(
+    session: Session,
+    *,
+    refresh_token: str,
+    access_token_expiry_minutes: int,
+) -> LoginResult:
+    """Rotate refresh credentials and revoke sessions on replay."""
+    if access_token_expiry_minutes < 1:
+        raise ValueError("Access-token expiry must be positive.")
+
+    token_digest = hash_token(refresh_token)
+    replay_detected = False
+    result: LoginResult | None = None
+
+    with session.begin():
+        # A credential may be current or already consumed.
+        session_user_id = session.scalar(
+            select(LoginSession.user_id).where(
+                LoginSession.refresh_token_hash == token_digest
+            )
+        )
+
+        if session_user_id is None:
+            session_user_id = session.scalar(
+                select(LoginSession.user_id)
+                .join(
+                    RefreshTokenHistory,
+                    RefreshTokenHistory.session_id == LoginSession.id,
+                )
+                .where(RefreshTokenHistory.token_hash == token_digest)
+            )
+
+        if session_user_id is None:
+            raise InvalidCredentialsError("Invalid refresh credential.")
+
+        # Lock the user first, consistent with login and other operations.
+        user = session.scalar(
+            select(User).where(User.id == session_user_id).with_for_update()
+        )
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid refresh credential.")
+
+        # Re-read history after acquiring the user lock.
+        # A concurrent refresh may have consumed this token meanwhile.
+        consumed_token = session.scalar(
+            select(RefreshTokenHistory).where(
+                RefreshTokenHistory.token_hash == token_digest
+            )
+        )
+
+        if consumed_token is not None:
+            login_session = session.scalar(
+                select(LoginSession)
+                .where(LoginSession.id == consumed_token.session_id)
+                .with_for_update()
+            )
+
+            if login_session is not None:
+                if login_session.revoked_at is None:
+                    login_session.refresh_token_hash = None
+                    login_session.revoked_at = datetime.now(UTC)
+                    login_session.revocation_reason = "refresh_token_replay"
+
+                replay_detected = True
+
+        else:
+            login_session = session.scalar(
+                select(LoginSession)
+                .where(
+                    LoginSession.user_id == user.id,
+                    LoginSession.refresh_token_hash == token_digest,
+                )
+                .with_for_update()
+            )
+
+            now = datetime.now(UTC)
+
+            if (
+                login_session is None
+                or login_session.revoked_at is not None
+                or login_session.expires_at <= now
+                or user.status != "active"
+                or user.password_reset_required
+            ):
+                raise InvalidCredentialsError("Invalid refresh credential.")
+
+            raw_access_token = generate_token()
+            raw_refresh_token = generate_token()
+
+            access_token_expires_at = min(
+                now + timedelta(minutes=access_token_expiry_minutes),
+                login_session.expires_at,
+            )
+
+            previous_token = RefreshTokenHistory(
+                session_id=login_session.id,
+                token_hash=token_digest,
+                used_at=now,
+            )
+
+            login_session.refresh_token_hash = hash_token(raw_refresh_token)
+            login_session.last_used_at = now
+
+            access_token = AccessToken(
+                session_id=login_session.id,
+                token_hash=hash_token(raw_access_token),
+                created_at=now,
+                expires_at=access_token_expires_at,
+            )
+
+            session.add(previous_token)
+            session.add(access_token)
+
+            result = LoginResult(
+                session_id=login_session.id,
+                access_token=raw_access_token,
+                refresh_token=raw_refresh_token,
+                access_token_expires_at=access_token_expires_at,
+                session_expires_at=login_session.expires_at,
+            )
+
+        session.flush()
+
+    # The transaction has committed before reporting a replay.
+    if replay_detected:
+        raise InvalidCredentialsError("Invalid refresh credential.")
+
+    if result is None:
+        raise InvalidCredentialsError("Invalid refresh credential.")
 
     return result
