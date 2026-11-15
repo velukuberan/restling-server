@@ -581,3 +581,32 @@ def refresh_session(
         raise InvalidCredentialsError("Invalid refresh credential.")
 
     return result
+
+
+def authenticate_access_token(
+    session: Session,
+    *,
+    access_token: str,
+) -> User:
+    """Resolve an eligible user from a valid opaque access token."""
+    token_digest = hash_token(access_token)
+    now = datetime.now(UTC)
+
+    user = session.scalar(
+        select(User)
+        .join(LoginSession, LoginSession.user_id == User.id)
+        .join(AccessToken, AccessToken.session_id == LoginSession.id)
+        .where(
+            AccessToken.token_hash == token_digest,
+            AccessToken.expires_at > now,
+            LoginSession.expires_at > now,
+            LoginSession.revoked_at.is_(None),
+            User.status == "active",
+            User.password_reset_required.is_(False),
+        )
+    )
+
+    if user is None:
+        raise InvalidCredentialsError("Invalid access credential.")
+
+    return user
