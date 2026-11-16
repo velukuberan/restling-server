@@ -82,6 +82,27 @@ If pytest is forcibly terminated, temporary databases may remain and require man
 CI environments must provide a compatible PostgreSQL instance, database privileges, and configuration before running integration tests.
 
 
+### Production Authentication Rate Limiting
+
+Production deployments must enforce rate limiting and request-abuse protection for authentication and credential-recovery endpoints at a trusted reverse proxy or API gateway.
+
+This includes:
+
+- `POST /api/v1/auth/activate`
+- `POST /api/v1/auth/reset-password`
+- Other authentication and session-management endpoints as they are introduced.
+
+Rate limiting must be applied before requests reach the FastAPI application. Configure appropriate request thresholds, burst limits, and responses for excessive requests based on the deployment environment.
+
+**Security considerations:**
+
+- Do not rely on application-local, in-memory counters for multi-worker deployments.
+- Use a trusted client IP address; do not blindly trust client-supplied forwarding headers.
+- Avoid logging authentication credentials, activation tokens, or password-reset tokens.
+- Rate limiting supplements token expiration, single-use enforcement, and credential validation; it does not replace them.
+
+Restling Server does not currently implement application-level rate limiting. Deployments exposing authentication endpoints publicly must configure and verify this protection before accepting production traffic.
+
 ## Administrator CLI
 
 Restling Server provides the `restling-admin` command for

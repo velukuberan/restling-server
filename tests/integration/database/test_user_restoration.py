@@ -209,6 +209,18 @@ def test_restoration_preserves_password_reset_policy(
         assert user.status == "active"
         assert user.password_reset_required is expected_reset_required
 
+        audit_event = session.scalar(
+            select(AuditLog).where(
+                AuditLog.target_user_id == user_id,
+                AuditLog.action == "user.restored",
+            )
+        )
+
+        assert audit_event is not None
+        assert audit_event.event_metadata == {
+            "password_reset_required": expected_reset_required,
+        }
+
 
 def test_ordinary_user_cannot_restore_an_account(
     test_engine: Engine,

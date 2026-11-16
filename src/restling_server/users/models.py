@@ -404,7 +404,7 @@ class RefreshTokenHistory(Base):
 
 
 class AuditLog(Base):
-    """Immutable historical record of a security-relevant event."""
+    """Historical record of a security-relevant event."""
 
     __tablename__ = "audit_logs"
 
