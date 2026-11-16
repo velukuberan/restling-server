@@ -10,10 +10,14 @@ from restling_server.core.dependencies import get_db_session
 from restling_server.users.schemas import (
     ActivateUserRequest,
     ActivateUserResponse,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
 )
 from restling_server.users.service import (
     InvalidActivationTokenError,
+    InvalidPasswordResetTokenError,
     activate_user,
+    reset_user_password,
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
@@ -64,3 +68,48 @@ def activate_account(
     response.headers["Cache-Control"] = "no-store"
 
     return ActivateUserResponse(message="Account activated successfully.")
+
+
+@router.post(
+    "/reset-password",
+    response_model=ResetPasswordResponse,
+    status_code=200,
+)
+def complete_password_reset(
+    payload: ResetPasswordRequest,
+    session: DbSession,
+    response: Response,
+) -> ResetPasswordResponse | JSONResponse:
+    """Complete password recovery using a one-time credential."""
+    try:
+        reset_user_password(
+            session,
+            token=payload.token,
+            new_password=payload.new_password,
+        )
+    except InvalidPasswordResetTokenError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "INVALID_PASSWORD_RESET_TOKEN",
+                    "message": "Invalid or expired password-reset credential.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "PASSWORD_POLICY_VIOLATION",
+                    "message": "Password does not meet the required policy.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return ResetPasswordResponse(message="Password reset successfully.")

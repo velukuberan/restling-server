@@ -14,3 +14,16 @@ class ActivateUserResponse(BaseModel):
     """Successful account activation response."""
 
     message: str
+
+
+class ResetPasswordRequest(BaseModel):
+    """Credentials submitted to complete password recovery."""
+
+    token: str = Field(min_length=1)
+    new_password: str
+
+
+class ResetPasswordResponse(BaseModel):
+    """Successful password recovery response."""
+
+    message: str

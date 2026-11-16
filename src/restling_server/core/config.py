@@ -34,6 +34,12 @@ class Settings(BaseSettings):
         validation_alias="RESTLING_INVITATION_EXPIRY_HOURS",
     )
 
+    password_reset_expiry_minutes: int = Field(
+        default=30,
+        ge=1,
+        validation_alias="RESTLING_PASSWORD_RESET_EXPIRY_MINUTES",
+    )
+
     # Opaque authentication tokens and active-session limits.
     access_token_expiry_minutes: int = Field(
         default=15,
