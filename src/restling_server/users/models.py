@@ -1,6 +1,7 @@
 """SQLAlchemy persistence models for user identity."""
 
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import (
@@ -14,6 +15,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from uuid6 import uuid7
 
@@ -398,4 +400,66 @@ class RefreshTokenHistory(Base):
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(UTC),
+    )
+
+
+class AuditLog(Base):
+    """Immutable historical record of a security-relevant event."""
+
+    __tablename__ = "audit_logs"
+
+    __table_args__ = (
+        CheckConstraint(
+            "LENGTH(TRIM(action)) > 0",
+            name="ck_audit_logs_action_not_empty",
+        ),
+        Index(
+            "ix_audit_logs_created_at_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_audit_logs_actor_created_at",
+            "actor_user_id",
+            "created_at",
+        ),
+        Index(
+            "ix_audit_logs_target_created_at",
+            "target_user_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        primary_key=True,
+        default=uuid7,
+    )
+
+    actor_user_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        nullable=True,
+    )
+
+    target_user_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        nullable=True,
+    )
+
+    action: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
+
+    event_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSONB,
+        nullable=False,
+        default=dict,
     )

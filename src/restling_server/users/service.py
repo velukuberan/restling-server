@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from restling_server.users.models import (
     AccessToken,
+    AuditLog,
     LoginSession,
     OneTimeToken,
     RefreshTokenHistory,
@@ -27,6 +28,9 @@ from restling_server.users.tokens import generate_token, hash_token
 # PostgreSQL advisory-lock identifiers reserved for administrator bootstrap.
 _BOOTSTRAP_LOCK_NAMESPACE = 723941
 _BOOTSTRAP_LOCK_ID = 1
+
+# Serialize operations that change active administrator membership.
+_ACCOUNT_LIFECYCLE_LOCK_ID = 2
 
 
 class AdministratorAlreadyInitializedError(Exception):
@@ -55,6 +59,26 @@ class InvalidCredentialsError(Exception):
 
 class SessionLimitReachedError(Exception):
     """The account has reached its active-session limit."""
+
+
+class PasswordResetNotAllowedError(Exception):
+    """The actor cannot issue a password-reset credential."""
+
+
+class InvalidPasswordResetTokenError(Exception):
+    """The password-reset credential is invalid or no longer usable."""
+
+
+class UserSuspensionNotAllowedError(Exception):
+    """The actor or target account is not eligible for suspension."""
+
+
+class LastAdministratorError(Exception):
+    """The operation would leave no active system administrator."""
+
+
+class UserRestorationNotAllowedError(Exception):
+    """The actor or target account is not eligible for restoration."""
 
 
 @dataclass(frozen=True)
@@ -288,6 +312,170 @@ def issue_activation_token(
         session.flush()
 
     return raw_token, expires_at
+
+
+def issue_password_reset_token(
+    session: Session,
+    *,
+    actor_id: UUID,
+    user_id: UUID,
+    expiry_minutes: int,
+) -> tuple[str, datetime]:
+    """Issue or replace a password-reset token for an existing user."""
+    if expiry_minutes < 1:
+        raise ValueError("Password-reset expiry must be positive.")
+
+    with session.begin():
+        actor = session.get(User, actor_id)
+
+        if (
+            actor is None
+            or actor.system_role != "administrator"
+            or actor.status != "active"
+            or actor.password_reset_required
+        ):
+            raise PasswordResetNotAllowedError("Administrator privileges are required.")
+
+        # Lock the user to serialize concurrent reset-token issuance.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None or user.status not in ("active", "suspended"):
+            raise PasswordResetNotAllowedError(
+                "Account is not eligible for password recovery."
+            )
+
+        now = datetime.now(UTC)
+
+        # Invalidate all previously usable reset credentials.
+        existing_tokens = session.scalars(
+            select(OneTimeToken).where(
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose == "password_reset",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+        ).all()
+
+        for existing_token in existing_tokens:
+            existing_token.revoked_at = now
+
+        raw_token = generate_token()
+        expires_at = now + timedelta(minutes=expiry_minutes)
+
+        reset_token = OneTimeToken(
+            user_id=user.id,
+            purpose="password_reset",
+            token_hash=hash_token(raw_token),
+            pending_email=None,
+            created_at=now,
+            expires_at=expires_at,
+        )
+
+        session.add(reset_token)
+        session.add(
+            AuditLog(
+                actor_user_id=actor_id,
+                target_user_id=user_id,
+                action="user.password_reset_issued",
+            )
+        )
+        session.flush()
+
+    return raw_token, expires_at
+
+
+def reset_user_password(
+    session: Session,
+    *,
+    token: str,
+    new_password: str,
+) -> None:
+    """Reset a user's password and revoke all existing sessions."""
+    token_digest = hash_token(token)
+
+    with session.begin():
+        # Identify the account associated with the reset token.
+        token_user_id = session.scalar(
+            select(OneTimeToken.user_id).where(
+                OneTimeToken.token_hash == token_digest,
+                OneTimeToken.purpose == "password_reset",
+            )
+        )
+
+        if token_user_id is None:
+            raise InvalidPasswordResetTokenError(
+                "Invalid or expired password-reset credential."
+            )
+
+        # Lock the user before locking the token or sessions.
+        # This follows the account-level locking convention.
+        user = session.scalar(
+            select(User).where(User.id == token_user_id).with_for_update()
+        )
+
+        if user is None or user.status not in ("active", "suspended"):
+            raise InvalidPasswordResetTokenError(
+                "Invalid or expired password-reset credential."
+            )
+
+        # Re-read after acquiring the user lock so a concurrent
+        # token replacement cannot leave a stale token usable.
+        stored_token = session.scalar(
+            select(OneTimeToken)
+            .where(
+                OneTimeToken.token_hash == token_digest,
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose == "password_reset",
+            )
+            .with_for_update()
+        )
+
+        now = datetime.now(UTC)
+
+        if (
+            stored_token is None
+            or stored_token.expires_at <= now
+            or stored_token.consumed_at is not None
+            or stored_token.revoked_at is not None
+        ):
+            raise InvalidPasswordResetTokenError(
+                "Invalid or expired password-reset credential."
+            )
+
+        # An invalid new password must not consume the token.
+        validate_password(new_password)
+        new_password_hash = hash_password(new_password)
+
+        # Lock and revoke all non-revoked login sessions.
+        login_sessions = session.scalars(
+            select(LoginSession)
+            .where(
+                LoginSession.user_id == user.id,
+                LoginSession.revoked_at.is_(None),
+            )
+            .order_by(LoginSession.id)
+            .with_for_update()
+        ).all()
+
+        for login_session in login_sessions:
+            login_session.refresh_token_hash = None
+            login_session.revoked_at = now
+            login_session.revocation_reason = "password_reset"
+
+        # Persist the new credential and clear forced-reset state.
+        user.password_hash = new_password_hash
+        user.password_reset_required = False
+
+        # The reset credential is single-use.
+        stored_token.consumed_at = now
+        session.add(
+            AuditLog(
+                actor_user_id=None,
+                target_user_id=user.id,
+                action="user.password_reset_completed",
+            )
+        )
+        session.flush()
 
 
 def activate_user(
@@ -878,3 +1066,142 @@ def revoke_other_sessions(
         session.flush()
 
         return len(other_sessions)
+
+
+def suspend_user(
+    session: Session,
+    *,
+    actor_id: UUID,
+    user_id: UUID,
+) -> None:
+    """Suspend an account and immediately revoke its login sessions."""
+    with session.begin():
+        # Serialize administrator lifecycle changes across workers.
+        # Future demotion/deletion operations must use this same lock.
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:namespace, :lock_id)"),
+            {
+                "namespace": _BOOTSTRAP_LOCK_NAMESPACE,
+                "lock_id": _ACCOUNT_LIFECYCLE_LOCK_ID,
+            },
+        )
+
+        actor = session.get(User, actor_id)
+
+        if (
+            actor is None
+            or actor.system_role != "administrator"
+            or actor.status != "active"
+            or actor.password_reset_required
+        ):
+            raise UserSuspensionNotAllowedError(
+                "Administrator privileges are required."
+            )
+
+        # Lock the target account before changing its state.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None or user.status != "active":
+            raise UserSuspensionNotAllowedError(
+                "Account is not eligible for suspension."
+            )
+
+        if user.system_role == "administrator":
+            active_administrator_count = session.scalar(
+                select(func.count(User.id)).where(
+                    User.system_role == "administrator",
+                    User.status == "active",
+                )
+            )
+
+            if active_administrator_count is None or active_administrator_count <= 1:
+                raise LastAdministratorError(
+                    "The last active administrator cannot be suspended."
+                )
+
+        now = datetime.now(UTC)
+
+        # Lock sessions in a deterministic order.
+        login_sessions = session.scalars(
+            select(LoginSession)
+            .where(
+                LoginSession.user_id == user.id,
+                LoginSession.revoked_at.is_(None),
+            )
+            .order_by(LoginSession.id)
+            .with_for_update()
+        ).all()
+
+        for login_session in login_sessions:
+            login_session.refresh_token_hash = None
+            login_session.revoked_at = now
+            login_session.revocation_reason = "account_suspended"
+
+        user.status = "suspended"
+
+        session.add(
+            AuditLog(
+                actor_user_id=actor_id,
+                target_user_id=user_id,
+                action="user.suspended",
+            )
+        )
+
+        session.flush()
+
+
+def restore_user(
+    session: Session,
+    *,
+    actor_id: UUID,
+    user_id: UUID,
+    require_password_reset: bool = False,
+) -> None:
+    """Restore a suspended account without reviving revoked sessions."""
+    with session.begin():
+        # Use the same lifecycle lock as suspension.
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:namespace, :lock_id)"),
+            {
+                "namespace": _BOOTSTRAP_LOCK_NAMESPACE,
+                "lock_id": _ACCOUNT_LIFECYCLE_LOCK_ID,
+            },
+        )
+
+        actor = session.get(User, actor_id)
+
+        if (
+            actor is None
+            or actor.system_role != "administrator"
+            or actor.status != "active"
+            or actor.password_reset_required
+        ):
+            raise UserRestorationNotAllowedError(
+                "Administrator privileges are required."
+            )
+
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None or user.status != "suspended":
+            raise UserRestorationNotAllowedError(
+                "Account is not eligible for restoration."
+            )
+
+        user.status = "active"
+
+        # Never silently clear an existing forced-reset restriction.
+        if require_password_reset:
+            user.password_reset_required = True
+
+        session.add(
+            AuditLog(
+                actor_user_id=actor_id,
+                target_user_id=user_id,
+                action="user.restored",
+                event_metadata={
+                    "password_reset_required": user.password_reset_required,
+                },
+            )
+        )
+
+        session.flush()
