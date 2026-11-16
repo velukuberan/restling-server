@@ -30,6 +30,57 @@ and synchronization remain future development milestones.
 
 Run `make help` for available commands. `make check` runs Ruff linting, formatting validation, Pyright, lockfile validation, and pytest.
 
+### PostgreSQL Integration Tests
+
+Restling Server uses real PostgreSQL databases for integration testing.
+
+The test fixtures in `tests/integration/conftest.py` use the following isolation strategy:
+
+1. Create a temporary PostgreSQL template database for each pytest session.
+2. Apply all Alembic migrations to the template once.
+3. Clone the migrated template into a separate database for each integration test.
+4. Drop each test database after its test completes.
+5. Drop the template database when the pytest session finishes.
+
+This ensures database isolation while avoiding repeated migrations.
+
+#### Requirements
+
+- A running local PostgreSQL server.
+- PostgreSQL credentials with permission to create databases (`CREATEDB`) and drop the databases owned by the test role.
+- A local `.env` configuration containing:
+
+```dotenv
+POSTGRES_HOST=127.0.0.1
+POSTGRES_DB=restling_dev
+POSTGRES_USER=restling
+POSTGRES_PASSWORD=your-local-password
+```
+
+Use a dedicated development/testing database role. Never use production credentials for integration tests.
+
+The fixtures require `POSTGRES_DB=restling_dev` and a loopback PostgreSQL host (`localhost`, `127.0.0.1`, or `::1`).
+
+#### Running Tests
+
+```bash
+uv run pytest
+```
+
+To run all quality checks:
+
+```bash
+make check
+```
+
+Tests automatically create temporary databases with generated names such as `restling_test_<uuid>`. These databases are deleted during normal fixture teardown.
+
+**Safety:** The test fixtures execute PostgreSQL `CREATE DATABASE` and `DROP DATABASE` statements. They must only run against a trusted local testing server.
+
+If pytest is forcibly terminated, temporary databases may remain and require manual inspection and cleanup.
+
+CI environments must provide a compatible PostgreSQL instance, database privileges, and configuration before running integration tests.
+
 
 ## Administrator CLI
 
