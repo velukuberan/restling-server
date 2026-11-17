@@ -118,3 +118,15 @@ class UserSessionsResponse(BaseModel):
 
     data: list[UserSessionDetail]
     pagination: PaginationDetail
+
+
+class RevokeOtherSessionsData(BaseModel):
+    """Result of revoking other active sessions."""
+
+    revoked_count: int
+
+
+class RevokeOtherSessionsResponse(BaseModel):
+    """Response for bulk revocation excluding the current session."""
+
+    data: RevokeOtherSessionsData

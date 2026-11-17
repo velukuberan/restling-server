@@ -361,3 +361,98 @@ def test_delete_current_session_invalidates_access(
     )
 
     assert profile.status_code == 401
+
+
+def test_revoke_other_sessions_preserves_current(
+    api_client: TestClient,
+    test_engine: Engine,
+) -> None:
+    """Revoke another session without invalidating the caller."""
+    first = create_login(api_client, test_engine)
+
+    second_response = api_client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": first["email"],
+            "password": first["password"],
+        },
+    )
+    assert second_response.status_code == 200
+    second = second_response.json()["data"]
+
+    first_headers = {"Authorization": f"Bearer {first['access_token']}"}
+    second_headers = {"Authorization": f"Bearer {second['access_token']}"}
+
+    response = api_client.post(
+        "/api/v1/users/me/sessions/revoke-others",
+        headers=first_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"data": {"revoked_count": 1}}
+    assert response.headers["cache-control"] == "no-store"
+
+    current_profile = api_client.get(
+        "/api/v1/users/me",
+        headers=first_headers,
+    )
+    assert current_profile.status_code == 200
+
+    revoked_profile = api_client.get(
+        "/api/v1/users/me",
+        headers=second_headers,
+    )
+    assert revoked_profile.status_code == 401
+
+    history = api_client.get(
+        "/api/v1/users/me/sessions",
+        headers=first_headers,
+    )
+    assert history.status_code == 200
+
+    by_id = {item["session_id"]: item for item in history.json()["data"]}
+
+    assert by_id[first["session_id"]]["status"] == "active"
+    assert by_id[first["session_id"]]["is_current"] is True
+    assert by_id[second["session_id"]]["status"] == "revoked"
+
+
+def test_revoke_other_sessions_is_repeatable(
+    api_client: TestClient,
+    test_engine: Engine,
+) -> None:
+    """Repeated bulk revocation succeeds when no other sessions remain."""
+    login = create_login(api_client, test_engine)
+
+    headers = {"Authorization": f"Bearer {login['access_token']}"}
+
+    for _ in range(2):
+        response = api_client.post(
+            "/api/v1/users/me/sessions/revoke-others",
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["revoked_count"] == 0
+
+    profile = api_client.get(
+        "/api/v1/users/me",
+        headers=headers,
+    )
+    assert profile.status_code == 200
+
+
+def test_revoke_other_sessions_requires_authentication(
+    api_client: TestClient,
+) -> None:
+    """Missing or invalid bearer credentials cannot revoke sessions."""
+    url = "/api/v1/users/me/sessions/revoke-others"
+
+    for headers in (
+        {},
+        {"Authorization": "Bearer invalid-token"},
+    ):
+        response = api_client.post(url, headers=headers)
+
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "UNAUTHORIZED"

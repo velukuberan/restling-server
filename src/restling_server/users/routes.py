@@ -28,6 +28,8 @@ from restling_server.users.schemas import (
     RefreshTokenRequest,
     ResetPasswordRequest,
     ResetPasswordResponse,
+    RevokeOtherSessionsData,
+    RevokeOtherSessionsResponse,
     UserDetail,
     UserDetailResponse,
     UserSessionDetail,
@@ -45,6 +47,7 @@ from restling_server.users.service import (
     logout_session,
     refresh_session,
     reset_user_password,
+    revoke_other_sessions,
     revoke_user_session,
 )
 
@@ -427,3 +430,34 @@ def delete_my_session(
     response.headers["Cache-Control"] = "no-store"
     response.status_code = 204
     return response
+
+
+@users_router.post(
+    "/me/sessions/revoke-others",
+    response_model=RevokeOtherSessionsResponse,
+    status_code=200,
+)
+def revoke_my_other_sessions(
+    credentials: LogoutCredentials,
+    session: DbSession,
+    response: Response,
+) -> RevokeOtherSessionsResponse | JSONResponse:
+    """Revoke all other active sessions while preserving the caller."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        revoked_count = revoke_other_sessions(
+            session,
+            access_token=credentials.credentials,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return RevokeOtherSessionsResponse(
+        data=RevokeOtherSessionsData(
+            revoked_count=revoked_count,
+        )
+    )
