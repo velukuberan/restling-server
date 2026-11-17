@@ -1,6 +1,9 @@
 """HTTP schemas for user management."""
 
-from pydantic import BaseModel, Field
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ActivateUserRequest(BaseModel):
@@ -27,3 +30,79 @@ class ResetPasswordResponse(BaseModel):
     """Successful password recovery response."""
 
     message: str
+
+
+class UserDetail(BaseModel):
+    """Publicly exposed user profile fields."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    email: str
+    display_name: str
+    job_title: str | None
+    status: str
+    system_role: str
+    created_at: datetime
+    updated_at: datetime
+    activated_at: datetime | None
+    password_reset_required: bool
+
+
+class UserDetailResponse(BaseModel):
+    """Response envelope for an individual user."""
+
+    data: UserDetail
+
+
+class LoginRequest(BaseModel):
+    """Credentials submitted for password authentication."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=1)
+    password: str = Field(min_length=1, repr=False)
+
+
+class LoginTokenData(BaseModel):
+    """Credentials and session information issued at login."""
+
+    access_token: str
+    refresh_token: str
+    token_type: str = "Bearer"
+    expires_in: int
+    refresh_expires_at: datetime
+    session_id: UUID
+
+
+class LoginResponse(BaseModel):
+    """Successful login response envelope."""
+
+    data: LoginTokenData
+
+
+class RefreshTokenRequest(BaseModel):
+    """Refresh credential submitted for token rotation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    refresh_token: str = Field(min_length=1, repr=False)
+
+
+class UserSessionDetail(BaseModel):
+    """Safe metadata for an active user session."""
+
+    session_id: UUID
+    created_at: datetime
+    expires_at: datetime
+    last_used_at: datetime | None
+    login_ip: str | None
+    last_seen_ip: str | None
+    machine_name: str | None
+    is_current: bool
+
+
+class UserSessionsResponse(BaseModel):
+    """Active sessions belonging to the authenticated user."""
+
+    data: list[UserSessionDetail]
