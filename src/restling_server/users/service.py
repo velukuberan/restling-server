@@ -2,11 +2,19 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 from uuid import UUID
 
 from email_validator import EmailNotValidError, validate_email
 from psycopg.errors import UniqueViolation
-from sqlalchemy import func, select, text
+from sqlalchemy import (
+    and_,
+    case,
+    func,
+    or_,
+    select,
+    text,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -104,6 +112,33 @@ class SessionSummary:
     last_seen_ip: str | None
     machine_name: str | None
     is_current: bool
+
+
+SessionStatus = Literal["active", "revoked", "expired"]
+
+
+@dataclass(frozen=True)
+class SessionHistoryItem:
+    """Safe metadata for a current or historical session."""
+
+    session_id: UUID
+    created_at: datetime
+    expires_at: datetime
+    last_used_at: datetime | None
+    revoked_at: datetime | None
+    login_ip: str | None
+    last_seen_ip: str | None
+    machine_name: str | None
+    status: SessionStatus
+    is_current: bool
+
+
+@dataclass(frozen=True)
+class SessionHistoryPage:
+    """Paginated sessions with an unpaginated total."""
+
+    items: list[SessionHistoryItem]
+    total: int
 
 
 def bootstrap_administrator(
@@ -913,6 +948,128 @@ def list_user_sessions(
         )
         for item in active_sessions
     ]
+
+
+def list_user_session_history(
+    session: Session,
+    *,
+    access_token: str,
+    status: SessionStatus | None = None,
+    limit: int = 25,
+    offset: int = 0,
+    retention_days: int = 30,
+) -> SessionHistoryPage:
+    """List retained sessions owned by the authenticated user."""
+    if not 1 <= limit <= 100:
+        raise ValueError("Session page limit must be between 1 and 100.")
+
+    if offset < 0:
+        raise ValueError("Session page offset cannot be negative.")
+
+    if retention_days < 1:
+        raise ValueError("Session history retention must be positive.")
+
+    if status not in (None, "active", "revoked", "expired"):
+        raise ValueError("Invalid session status.")
+
+    user = authenticate_access_token(
+        session,
+        access_token=access_token,
+    )
+
+    current_session_id = session.scalar(
+        select(LoginSession.id)
+        .join(AccessToken, AccessToken.session_id == LoginSession.id)
+        .where(
+            AccessToken.token_hash == hash_token(access_token),
+            LoginSession.user_id == user.id,
+        )
+    )
+
+    if current_session_id is None:
+        raise InvalidCredentialsError("Invalid access credential.")
+
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(days=retention_days)
+
+    active = and_(
+        LoginSession.revoked_at.is_(None),
+        LoginSession.expires_at > now,
+    )
+
+    revoked = and_(
+        LoginSession.revoked_at.is_not(None),
+        LoginSession.revoked_at >= cutoff,
+    )
+
+    expired = and_(
+        LoginSession.revoked_at.is_(None),
+        LoginSession.expires_at <= now,
+        LoginSession.expires_at >= cutoff,
+    )
+
+    if status == "active":
+        visibility = active
+    elif status == "revoked":
+        visibility = revoked
+    elif status == "expired":
+        visibility = expired
+    else:
+        visibility = or_(active, revoked, expired)
+
+    criteria = and_(
+        LoginSession.user_id == user.id,
+        visibility,
+    )
+
+    total = session.scalar(select(func.count(LoginSession.id)).where(criteria))
+
+    active_first = case(
+        (active, 0),
+        else_=1,
+    )
+
+    records = session.scalars(
+        select(LoginSession)
+        .where(criteria)
+        .order_by(
+            active_first,
+            LoginSession.created_at.desc(),
+            LoginSession.id.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    ).all()
+
+    items: list[SessionHistoryItem] = []
+
+    for record in records:
+        if record.revoked_at is not None:
+            record_status: SessionStatus = "revoked"
+        elif record.expires_at <= now:
+            record_status = "expired"
+        else:
+            record_status = "active"
+
+        items.append(
+            SessionHistoryItem(
+                session_id=record.id,
+                created_at=record.created_at,
+                expires_at=record.expires_at,
+                last_used_at=record.last_used_at,
+                revoked_at=record.revoked_at,
+                login_ip=record.login_ip,
+                last_seen_ip=record.last_seen_ip,
+                machine_name=record.machine_name,
+                status=record_status,
+                is_current=record.id == current_session_id,
+            )
+        )
+
+    return SessionHistoryPage(
+        items=items,
+        total=total if total is not None else 0,
+    )
 
 
 def revoke_user_session(

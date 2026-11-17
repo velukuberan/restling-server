@@ -59,6 +59,12 @@ class Settings(BaseSettings):
         validation_alias="RESTLING_MAX_ACTIVE_SESSIONS",
     )
 
+    session_history_retention_days: int = Field(
+        default=30,
+        ge=1,
+        validation_alias="RESTLING_SESSION_HISTORY_RETENTION_DAYS",
+    )
+
     public_url: AnyHttpUrl | None = Field(
         default=None,
         validation_alias="RESTLING_PUBLIC_URL",

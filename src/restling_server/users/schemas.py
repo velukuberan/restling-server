@@ -1,6 +1,7 @@
 """HTTP schemas for user management."""
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -90,19 +91,30 @@ class RefreshTokenRequest(BaseModel):
 
 
 class UserSessionDetail(BaseModel):
-    """Safe metadata for an active user session."""
+    """Safe metadata for a current or historical session."""
 
     session_id: UUID
     created_at: datetime
     expires_at: datetime
     last_used_at: datetime | None
+    revoked_at: datetime | None
     login_ip: str | None
     last_seen_ip: str | None
     machine_name: str | None
+    status: Literal["active", "revoked", "expired"]
     is_current: bool
 
 
+class PaginationDetail(BaseModel):
+    """Offset pagination metadata."""
+
+    limit: int
+    offset: int
+    total: int
+
+
 class UserSessionsResponse(BaseModel):
-    """Active sessions belonging to the authenticated user."""
+    """Paginated session history response."""
 
     data: list[UserSessionDetail]
+    pagination: PaginationDetail

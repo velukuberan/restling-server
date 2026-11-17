@@ -14,6 +14,7 @@ from restling_server.users.passwords import hash_password
 from restling_server.users.service import (
     InvalidCredentialsError,
     authenticate_access_token,
+    list_user_session_history,
     list_user_sessions,
     login_user,
     refresh_session,
@@ -1051,3 +1052,182 @@ def test_revoke_user_session_can_revoke_current_session(
                 delete(LoginSession).where(LoginSession.user_id.in_(user_ids))
             )
             connection.execute(delete(User).where(User.normalized_email == email))
+
+
+def test_session_history_retention_ordering_and_isolation(
+    test_engine: Engine,
+) -> None:
+    """Retain recent history and paginate sessions deterministically."""
+    email = f"history-owner-{uuid7().hex}@example.com"
+    other_email = f"history-other-{uuid7().hex}@example.com"
+    password = "A secure session history passphrase #8472"
+
+    try:
+        with Session(test_engine) as session:
+            for address in (email, other_email):
+                session.add(
+                    User(
+                        email=address,
+                        normalized_email=address,
+                        display_name="Session History User",
+                        status="active",
+                        system_role="user",
+                        password_hash=hash_password(password),
+                    )
+                )
+            session.commit()
+
+        def create_login(address: str):
+            with Session(test_engine) as session:
+                return login_user(
+                    session,
+                    email=address,
+                    password=password,
+                    access_token_expiry_minutes=15,
+                    refresh_session_expiry_days=7,
+                    max_active_sessions=10,
+                )
+
+        current = create_login(email)
+        other_active = create_login(email)
+        recent_revoked = create_login(email)
+        old_revoked = create_login(email)
+        recent_expired = create_login(email)
+        old_expired = create_login(email)
+        foreign = create_login(other_email)
+
+        now = datetime.now(UTC)
+        tied_created_at = now - timedelta(minutes=1)
+
+        with Session(test_engine) as session:
+            current_record = session.get(LoginSession, current.session_id)
+            other_active_record = session.get(LoginSession, other_active.session_id)
+
+            assert current_record is not None
+            assert other_active_record is not None
+
+            # Deliberately give the active sessions identical timestamps.
+            # UUID is the stable secondary sorting key.
+            current_record.created_at = tied_created_at
+            other_active_record.created_at = tied_created_at
+
+            for result, revoked_days in (
+                (recent_revoked, 2),
+                (old_revoked, 31),
+            ):
+                record = session.get(LoginSession, result.session_id)
+                assert record is not None
+
+                record.refresh_token_hash = None
+                record.revoked_at = now - timedelta(days=revoked_days)
+                record.revocation_reason = "logout"
+
+            for result, expired_days in (
+                (recent_expired, 2),
+                (old_expired, 31),
+            ):
+                record = session.get(LoginSession, result.session_id)
+                assert record is not None
+
+                record.created_at = now - timedelta(days=expired_days + 7)
+                record.expires_at = now - timedelta(days=expired_days)
+
+            session.commit()
+
+        with Session(test_engine) as session:
+            page = list_user_session_history(
+                session,
+                access_token=current.access_token,
+                retention_days=30,
+            )
+
+            # Two active + one recently revoked + one recently expired.
+            assert page.total == 4
+            assert len(page.items) == 4
+
+            assert [item.status for item in page.items] == [
+                "active",
+                "active",
+                "revoked",
+                "expired",
+            ]
+
+            active_ids = sorted(
+                [current.session_id, other_active.session_id],
+                reverse=True,
+            )
+
+            assert [item.session_id for item in page.items[:2]] == active_ids
+
+            assert {item.session_id for item in page.items} == {
+                current.session_id,
+                other_active.session_id,
+                recent_revoked.session_id,
+                recent_expired.session_id,
+            }
+
+            assert all(item.session_id != foreign.session_id for item in page.items)
+
+            assert sum(item.is_current for item in page.items) == 1
+            assert (
+                next(item for item in page.items if item.is_current).session_id
+                == current.session_id
+            )
+
+            revoked_page = list_user_session_history(
+                session,
+                access_token=current.access_token,
+                status="revoked",
+                retention_days=30,
+            )
+
+            assert revoked_page.total == 1
+            assert revoked_page.items[0].session_id == (recent_revoked.session_id)
+            assert revoked_page.items[0].revoked_at is not None
+
+            expired_page = list_user_session_history(
+                session,
+                access_token=current.access_token,
+                status="expired",
+                retention_days=30,
+            )
+
+            assert expired_page.total == 1
+            assert expired_page.items[0].session_id == (recent_expired.session_id)
+
+            first_page = list_user_session_history(
+                session,
+                access_token=current.access_token,
+                limit=2,
+                offset=0,
+                retention_days=30,
+            )
+
+            second_page = list_user_session_history(
+                session,
+                access_token=current.access_token,
+                limit=2,
+                offset=2,
+                retention_days=30,
+            )
+
+            assert first_page.total == 4
+            assert second_page.total == 4
+
+            assert [
+                item.session_id for item in (first_page.items + second_page.items)
+            ] == [item.session_id for item in page.items]
+
+    finally:
+        with test_engine.begin() as connection:
+            user_ids = select(User.id).where(
+                User.normalized_email.in_([email, other_email])
+            )
+
+            connection.execute(
+                delete(LoginSession).where(LoginSession.user_id.in_(user_ids))
+            )
+
+            connection.execute(
+                delete(User).where(User.normalized_email.in_([email, other_email]))
+            )

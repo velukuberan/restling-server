@@ -1,11 +1,12 @@
 """HTTP routes for user authentication and activation."""
 
 from datetime import UTC, datetime
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 
 from fastapi import (
     APIRouter,
     Depends,
+    Query,
     Request,
     Response,
 )
@@ -22,6 +23,7 @@ from restling_server.users.schemas import (
     LoginRequest,
     LoginResponse,
     LoginTokenData,
+    PaginationDetail,
     RefreshTokenRequest,
     ResetPasswordRequest,
     ResetPasswordResponse,
@@ -36,7 +38,7 @@ from restling_server.users.service import (
     InvalidPasswordResetTokenError,
     SessionLimitReachedError,
     activate_user,
-    list_user_sessions,
+    list_user_session_history,
     login_user,
     logout_session,
     refresh_session,
@@ -330,16 +332,29 @@ def logout(
 def get_my_sessions(
     credentials: LogoutCredentials,
     session: DbSession,
+    request: Request,
     response: Response,
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    status: Annotated[
+        Literal["active", "revoked", "expired"] | None,
+        Query(),
+    ] = None,
 ) -> UserSessionsResponse | JSONResponse:
-    """List active sessions belonging to the authenticated user."""
+    """List current and historical sessions for the caller."""
     if credentials is None:
         return unauthorized_logout_response()
 
+    settings = cast(Settings, request.app.state.settings)
+
     try:
-        sessions = list_user_sessions(
+        result = list_user_session_history(
             session,
             access_token=credentials.credentials,
+            status=status,
+            limit=limit,
+            offset=offset,
+            retention_days=settings.session_history_retention_days,
         )
     except InvalidCredentialsError:
         return unauthorized_logout_response()
@@ -353,11 +368,18 @@ def get_my_sessions(
                 created_at=item.created_at,
                 expires_at=item.expires_at,
                 last_used_at=item.last_used_at,
+                revoked_at=item.revoked_at,
                 login_ip=item.login_ip,
                 last_seen_ip=item.last_seen_ip,
                 machine_name=item.machine_name,
+                status=item.status,
                 is_current=item.is_current,
             )
-            for item in sessions
-        ]
+            for item in result.items
+        ],
+        pagination=PaginationDetail(
+            limit=limit,
+            offset=offset,
+            total=result.total,
+        ),
     )

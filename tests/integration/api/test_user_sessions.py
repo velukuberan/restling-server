@@ -1,11 +1,14 @@
 """HTTP integration tests for user session listing."""
 
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 from uuid6 import uuid7
 
-from restling_server.users.models import User
+from restling_server.users.models import LoginSession, User
 from restling_server.users.passwords import hash_password
 
 
@@ -126,3 +129,136 @@ def test_session_listing_excludes_other_users(
 
     assert first["session_id"] in session_ids
     assert second["session_id"] not in session_ids
+
+
+def test_session_history_filters_and_pagination(
+    api_client: TestClient,
+    test_engine: Engine,
+) -> None:
+    """Show active, revoked and expired sessions with stable paging."""
+    first = create_login(api_client, test_engine)
+
+    credentials = {
+        "email": first["email"],
+        "password": first["password"],
+    }
+
+    def new_login() -> dict[str, str]:
+        response = api_client.post(
+            "/api/v1/auth/login",
+            json=credentials,
+        )
+        assert response.status_code == 200
+        return response.json()["data"]
+
+    second = new_login()
+
+    logout = api_client.post(
+        "/api/v1/auth/logout",
+        headers={"Authorization": f"Bearer {second['access_token']}"},
+    )
+    assert logout.status_code == 204
+
+    third = new_login()
+
+    with Session(test_engine) as session:
+        expired = session.get(
+            LoginSession,
+            UUID(third["session_id"]),
+        )
+        assert expired is not None
+
+        now = datetime.now(UTC)
+        expired.created_at = now - timedelta(days=8)
+        expired.expires_at = now - timedelta(days=1)
+        session.commit()
+
+    fourth = new_login()
+
+    headers = {"Authorization": f"Bearer {first['access_token']}"}
+    url = "/api/v1/users/me/sessions"
+
+    response = api_client.get(url, headers=headers)
+
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["pagination"] == {
+        "limit": 25,
+        "offset": 0,
+        "total": 4,
+    }
+
+    sessions = body["data"]
+
+    assert [item["status"] for item in sessions] == [
+        "active",
+        "active",
+        "revoked",
+        "expired",
+    ]
+
+    assert {item["session_id"] for item in sessions} == {
+        first["session_id"],
+        second["session_id"],
+        third["session_id"],
+        fourth["session_id"],
+    }
+
+    current = [item for item in sessions if item["is_current"]]
+    assert len(current) == 1
+    assert current[0]["session_id"] == first["session_id"]
+
+    for status, expected_id in (
+        ("revoked", second["session_id"]),
+        ("expired", third["session_id"]),
+    ):
+        filtered = api_client.get(
+            url,
+            params={"status": status},
+            headers=headers,
+        )
+
+        assert filtered.status_code == 200
+        assert filtered.json()["pagination"]["total"] == 1
+        assert filtered.json()["data"][0]["session_id"] == expected_id
+
+    first_page = api_client.get(
+        url,
+        params={"limit": 1, "offset": 0},
+        headers=headers,
+    )
+    second_page = api_client.get(
+        url,
+        params={"limit": 1, "offset": 1},
+        headers=headers,
+    )
+
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+
+    assert first_page.json()["pagination"]["total"] == 4
+    assert second_page.json()["pagination"]["total"] == 4
+
+    assert (
+        first_page.json()["data"][0]["session_id"]
+        != second_page.json()["data"][0]["session_id"]
+    )
+
+
+def test_session_history_validates_query_parameters(
+    api_client: TestClient,
+) -> None:
+    """Reject unsupported filters and invalid pagination values."""
+    url = "/api/v1/users/me/sessions"
+
+    for params in (
+        {"status": "unknown"},
+        {"limit": 0},
+        {"limit": 101},
+        {"offset": -1},
+    ):
+        response = api_client.get(url, params=params)
+
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "VALIDATION_ERROR"
