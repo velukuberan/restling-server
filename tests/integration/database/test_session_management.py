@@ -19,6 +19,7 @@ from restling_server.users.service import (
     list_user_sessions,
     login_user,
     refresh_session,
+    revoke_all_user_sessions,
     revoke_other_sessions,
     revoke_user_session,
 )
@@ -1228,3 +1229,193 @@ def test_session_history_retention_ordering_and_isolation(
             connection.execute(
                 delete(User).where(User.normalized_email.in_([email, other_email]))
             )
+
+
+def test_revoke_all_sessions_does_not_affect_other_users(
+    test_engine: Engine,
+) -> None:
+    """Bulk revocation affects only the authenticated user's sessions."""
+    email_a = f"bulk-owner-a-{uuid7().hex}@example.com"
+    email_b = f"bulk-owner-b-{uuid7().hex}@example.com"
+    password = "A secure bulk isolation passphrase #8472"
+
+    try:
+        with Session(test_engine) as session:
+            for email in (email_a, email_b):
+                session.add(
+                    User(
+                        email=email,
+                        normalized_email=email,
+                        display_name="Bulk Isolation User",
+                        status="active",
+                        system_role="user",
+                        password_hash=hash_password(password),
+                    )
+                )
+            session.commit()
+
+        def create_login(email: str):
+            with Session(test_engine) as session:
+                return login_user(
+                    session,
+                    email=email,
+                    password=password,
+                    access_token_expiry_minutes=15,
+                    refresh_session_expiry_days=7,
+                    max_active_sessions=2,
+                )
+
+        current_a = create_login(email_a)
+        other_a = create_login(email_a)
+        current_b = create_login(email_b)
+
+        with Session(test_engine) as session:
+            revoke_all_user_sessions(
+                session,
+                access_token=current_a.access_token,
+            )
+
+        with Session(test_engine) as session:
+            stored_current_a = session.get(LoginSession, current_a.session_id)
+            stored_other_a = session.get(LoginSession, other_a.session_id)
+            stored_b = session.get(LoginSession, current_b.session_id)
+
+            # Both User A sessions must be revoked.
+            assert stored_current_a is not None
+            assert stored_current_a.revoked_at is not None
+
+            assert stored_other_a is not None
+            assert stored_other_a.revoked_at is not None
+
+            # User B must remain unaffected.
+            assert stored_b is not None
+            assert stored_b.revoked_at is None
+            assert stored_b.refresh_token_hash == hash_token(current_b.refresh_token)
+
+        # User B must still be able to authenticate and refresh.
+        with Session(test_engine) as session:
+            authenticated = authenticate_access_token(
+                session,
+                access_token=current_b.access_token,
+            )
+            assert authenticated.email == email_b
+
+        with Session(test_engine) as session:
+            refreshed = refresh_session(
+                session,
+                refresh_token=current_b.refresh_token,
+                access_token_expiry_minutes=15,
+            )
+
+        assert refreshed.session_id == current_b.session_id
+
+    finally:
+        with test_engine.begin() as connection:
+            user_ids = select(User.id).where(
+                User.normalized_email.in_([email_a, email_b])
+            )
+
+            connection.execute(
+                delete(LoginSession).where(LoginSession.user_id.in_(user_ids))
+            )
+            connection.execute(
+                delete(User).where(User.normalized_email.in_([email_a, email_b]))
+            )
+
+
+def test_revoke_all_sessions_rolls_back_on_failure(
+    test_engine: Engine,
+) -> None:
+    """Failure during bulk revocation rolls back all session updates."""
+    email = f"bulk-rollback-{uuid7().hex}@example.com"
+    password = "A secure bulk rollback passphrase #8472"
+
+    try:
+        with Session(test_engine) as session:
+            user = User(
+                email=email,
+                normalized_email=email,
+                display_name="Bulk Rollback User",
+                status="active",
+                system_role="user",
+                password_hash=hash_password(password),
+            )
+            session.add(user)
+            session.commit()
+
+        def create_login():
+            with Session(test_engine) as session:
+                return login_user(
+                    session,
+                    email=email,
+                    password=password,
+                    access_token_expiry_minutes=15,
+                    refresh_session_expiry_days=7,
+                    max_active_sessions=3,
+                )
+
+        current = create_login()
+        second = create_login()
+        third = create_login()
+
+        updates_seen = 0
+
+        def reject_second_update(
+            _mapper: Mapper[LoginSession],
+            _connection: Connection,
+            _target: LoginSession,
+        ) -> None:
+            nonlocal updates_seen
+            updates_seen += 1
+
+            if updates_seen == 2:
+                raise RuntimeError("Simulated bulk revocation failure")
+
+        event.listen(LoginSession, "before_update", reject_second_update)
+
+        try:
+            with Session(test_engine) as session:
+                with pytest.raises(
+                    RuntimeError,
+                    match="Simulated bulk revocation failure",
+                ):
+                    revoke_other_sessions(
+                        session,
+                        access_token=current.access_token,
+                    )
+        finally:
+            event.remove(
+                LoginSession,
+                "before_update",
+                reject_second_update,
+            )
+
+        assert updates_seen == 2
+
+        # Neither session should have been revoked.
+        with Session(test_engine) as session:
+            for login in (current, second, third):
+                stored = session.get(LoginSession, login.session_id)
+
+                assert stored is not None
+                assert stored.revoked_at is None
+                assert stored.revocation_reason is None
+                assert stored.refresh_token_hash == hash_token(login.refresh_token)
+
+        # Retrying the operation should revoke both other sessions.
+        with Session(test_engine) as session:
+            revoked_count = revoke_other_sessions(
+                session,
+                access_token=current.access_token,
+            )
+
+        assert revoked_count == 2
+
+    finally:
+        with test_engine.begin() as connection:
+            user_ids = select(User.id).where(User.normalized_email == email)
+
+            connection.execute(
+                delete(LoginSession).where(LoginSession.user_id.in_(user_ids))
+            )
+            connection.execute(delete(User).where(User.normalized_email == email))

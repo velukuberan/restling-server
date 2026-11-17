@@ -456,3 +456,79 @@ def test_revoke_other_sessions_requires_authentication(
 
         assert response.status_code == 401
         assert response.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+def test_revoke_all_sessions_invalidates_every_session(
+    api_client: TestClient,
+    test_engine: Engine,
+) -> None:
+    """Bulk revocation invalidates both current and other sessions."""
+    first = create_login(api_client, test_engine)
+
+    second_response = api_client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": first["email"],
+            "password": first["password"],
+        },
+    )
+    assert second_response.status_code == 200
+    second = second_response.json()["data"]
+
+    first_headers = {"Authorization": f"Bearer {first['access_token']}"}
+    second_headers = {"Authorization": f"Bearer {second['access_token']}"}
+
+    response = api_client.delete(
+        "/api/v1/users/me/sessions",
+        headers=first_headers,
+    )
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+
+    for headers in (first_headers, second_headers):
+        profile = api_client.get(
+            "/api/v1/users/me",
+            headers=headers,
+        )
+        assert profile.status_code == 401
+
+    # Fresh authentication must still work.
+    new_login = api_client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": first["email"],
+            "password": first["password"],
+        },
+    )
+    assert new_login.status_code == 200
+
+    history = api_client.get(
+        "/api/v1/users/me/sessions",
+        headers={
+            "Authorization": (f"Bearer {new_login.json()['data']['access_token']}")
+        },
+    )
+    assert history.status_code == 200
+
+    by_id = {item["session_id"]: item for item in history.json()["data"]}
+
+    assert by_id[first["session_id"]]["status"] == "revoked"
+    assert by_id[second["session_id"]]["status"] == "revoked"
+
+
+def test_revoke_all_sessions_rejects_invalid_authentication(
+    api_client: TestClient,
+) -> None:
+    """An unauthenticated request cannot revoke sessions."""
+    url = "/api/v1/users/me/sessions"
+
+    for headers in (
+        {},
+        {"Authorization": "Bearer invalid-token"},
+    ):
+        response = api_client.delete(url, headers=headers)
+
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "UNAUTHORIZED"

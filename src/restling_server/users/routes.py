@@ -47,6 +47,7 @@ from restling_server.users.service import (
     logout_session,
     refresh_session,
     reset_user_password,
+    revoke_all_user_sessions,
     revoke_other_sessions,
     revoke_user_session,
 )
@@ -460,4 +461,32 @@ def revoke_my_other_sessions(
         data=RevokeOtherSessionsData(
             revoked_count=revoked_count,
         )
+    )
+
+
+@users_router.delete(
+    "/me/sessions",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def revoke_my_all_sessions(
+    credentials: LogoutCredentials,
+    session: DbSession,
+) -> Response | JSONResponse:
+    """Revoke every session owned by the authenticated user."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        revoke_all_user_sessions(
+            session,
+            access_token=credentials.credentials,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    return Response(
+        status_code=204,
+        headers={"Cache-Control": "no-store"},
     )

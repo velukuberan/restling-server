@@ -1232,6 +1232,77 @@ def revoke_other_sessions(
         return len(other_sessions)
 
 
+def revoke_all_user_sessions(
+    session: Session,
+    *,
+    access_token: str,
+) -> None:
+    """Revoke every active session belonging to the authenticated user."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        user_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if user_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Serialize session changes at the account level.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate the credential after acquiring the account lock.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or user.status != "active"
+            or user.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        active_sessions = session.scalars(
+            select(LoginSession)
+            .where(
+                LoginSession.user_id == user.id,
+                LoginSession.revoked_at.is_(None),
+                LoginSession.expires_at > now,
+            )
+            .order_by(LoginSession.id)
+            .with_for_update()
+        ).all()
+
+        for active_session in active_sessions:
+            active_session.refresh_token_hash = None
+            active_session.revoked_at = now
+            active_session.revocation_reason = "user_revoked"
+
+        session.flush()
+
+
 def suspend_user(
     session: Session,
     *,
