@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 from typing import Annotated, Literal, cast
+from uuid import UUID
 
 from fastapi import (
     APIRouter,
@@ -37,12 +38,14 @@ from restling_server.users.service import (
     InvalidCredentialsError,
     InvalidPasswordResetTokenError,
     SessionLimitReachedError,
+    SessionNotFoundError,
     activate_user,
     list_user_session_history,
     login_user,
     logout_session,
     refresh_session,
     reset_user_password,
+    revoke_user_session,
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
@@ -383,3 +386,44 @@ def get_my_sessions(
             total=result.total,
         ),
     )
+
+
+@users_router.delete(
+    "/me/sessions/{session_id}",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def delete_my_session(
+    session_id: UUID,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    response: Response,
+) -> Response | JSONResponse:
+    """Revoke an owned session without deleting its history."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        revoke_user_session(
+            session,
+            access_token=credentials.credentials,
+            target_session_id=session_id,
+        )
+    except SessionNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "SESSION_NOT_FOUND",
+                    "message": "Session not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    response.headers["Cache-Control"] = "no-store"
+    response.status_code = 204
+    return response

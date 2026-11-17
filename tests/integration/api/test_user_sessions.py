@@ -262,3 +262,102 @@ def test_session_history_validates_query_parameters(
 
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_delete_owned_session_preserves_history(
+    api_client: TestClient,
+    test_engine: Engine,
+) -> None:
+    """Revoking another session preserves the caller and history."""
+    first = create_login(api_client, test_engine)
+
+    second_response = api_client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": first["email"],
+            "password": first["password"],
+        },
+    )
+    assert second_response.status_code == 200
+    second = second_response.json()["data"]
+
+    first_headers = {"Authorization": f"Bearer {first['access_token']}"}
+    second_headers = {"Authorization": f"Bearer {second['access_token']}"}
+
+    url = f"/api/v1/users/me/sessions/{second['session_id']}"
+
+    deleted = api_client.delete(url, headers=first_headers)
+
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+
+    # The target credentials must immediately stop working.
+    rejected = api_client.get(
+        "/api/v1/users/me",
+        headers=second_headers,
+    )
+    assert rejected.status_code == 401
+
+    # The caller remains authenticated.
+    profile = api_client.get(
+        "/api/v1/users/me",
+        headers=first_headers,
+    )
+    assert profile.status_code == 200
+
+    # The revoked session remains visible in history.
+    history = api_client.get(
+        "/api/v1/users/me/sessions",
+        params={"status": "revoked"},
+        headers=first_headers,
+    )
+
+    assert history.status_code == 200
+    assert second["session_id"] in {
+        item["session_id"] for item in history.json()["data"]
+    }
+
+    # Revoking the same owned session again succeeds.
+    repeated = api_client.delete(url, headers=first_headers)
+
+    assert repeated.status_code == 204
+
+
+def test_delete_session_rejects_unknown_target(
+    api_client: TestClient,
+    test_engine: Engine,
+) -> None:
+    """Unknown session identifiers must not be revocable."""
+    login = create_login(api_client, test_engine)
+
+    response = api_client.delete(
+        f"/api/v1/users/me/sessions/{uuid7()}",
+        headers={"Authorization": f"Bearer {login['access_token']}"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "SESSION_NOT_FOUND"
+
+
+def test_delete_current_session_invalidates_access(
+    api_client: TestClient,
+    test_engine: Engine,
+) -> None:
+    """A user may revoke their own current session."""
+    login = create_login(api_client, test_engine)
+
+    headers = {"Authorization": f"Bearer {login['access_token']}"}
+
+    response = api_client.delete(
+        f"/api/v1/users/me/sessions/{login['session_id']}",
+        headers=headers,
+    )
+
+    assert response.status_code == 204
+
+    profile = api_client.get(
+        "/api/v1/users/me",
+        headers=headers,
+    )
+
+    assert profile.status_code == 401

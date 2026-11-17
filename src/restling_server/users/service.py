@@ -65,6 +65,10 @@ class InvalidCredentialsError(Exception):
     """The supplied login credentials are invalid."""
 
 
+class SessionNotFoundError(InvalidCredentialsError):
+    """The requested session does not belong to the user or does not exist."""
+
+
 class SessionLimitReachedError(Exception):
     """The account has reached its active-session limit."""
 
@@ -1132,14 +1136,17 @@ def revoke_user_session(
             .where(
                 LoginSession.id == target_session_id,
                 LoginSession.user_id == user.id,
-                LoginSession.revoked_at.is_(None),
-                LoginSession.expires_at > now,
             )
             .with_for_update()
         )
 
         if target is None:
-            raise InvalidCredentialsError("Session not found or not available.")
+            raise SessionNotFoundError("Session not found.")
+
+        # Revocation is idempotent for owned historical sessions.
+        # Preserve their original status and revocation reason.
+        if target.revoked_at is not None or target.expires_at <= now:
+            return
 
         target.refresh_token_hash = None
         target.revoked_at = now

@@ -13,6 +13,7 @@ from restling_server.users.models import LoginSession, User
 from restling_server.users.passwords import hash_password
 from restling_server.users.service import (
     InvalidCredentialsError,
+    SessionNotFoundError,
     authenticate_access_token,
     list_user_session_history,
     list_user_sessions,
@@ -393,8 +394,8 @@ def test_revoke_user_session_rejects_other_users_session(
         # User A attempts to revoke User B's session.
         with Session(test_engine) as session:
             with pytest.raises(
-                InvalidCredentialsError,
-                match="Session not found or not available",
+                SessionNotFoundError,
+                match=r"Session not found\.",
             ):
                 revoke_user_session(
                     session,
@@ -465,8 +466,8 @@ def test_revoke_user_session_rejects_unknown_target(
 
         with Session(test_engine) as session:
             with pytest.raises(
-                InvalidCredentialsError,
-                match="Session not found or not available",
+                SessionNotFoundError,
+                match=r"Session not found\.",
             ):
                 revoke_user_session(
                     session,
@@ -497,7 +498,7 @@ def test_revoke_user_session_rejects_unknown_target(
 
 
 @pytest.mark.parametrize("target_state", ["revoked", "expired"])
-def test_revoke_user_session_rejects_inactive_target(
+def test_revoke_user_session_accepts_inactive_target(
     test_engine: Engine,
     target_state: str,
 ) -> None:
@@ -555,15 +556,11 @@ def test_revoke_user_session_rejects_inactive_target(
             session.commit()
 
         with Session(test_engine) as session:
-            with pytest.raises(
-                InvalidCredentialsError,
-                match="Session not found or not available",
-            ):
-                revoke_user_session(
-                    session,
-                    access_token=current.access_token,
-                    target_session_id=target_login.session_id,
-                )
+            revoke_user_session(
+                session,
+                access_token=current.access_token,
+                target_session_id=target_login.session_id,
+            )
 
         with Session(test_engine) as session:
             target = session.get(LoginSession, target_login.session_id)
