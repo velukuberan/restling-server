@@ -97,6 +97,14 @@ class ReissueInvitationResponse(BaseModel):
     invitation: UserInvitationDetail
 
 
+class RestoreUserRequest(BaseModel):
+    """Administrator request to restore a suspended account."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    require_password_reset: bool = False
+
+
 class LoginRequest(BaseModel):
     """Credentials submitted for password authentication."""
 

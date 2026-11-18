@@ -40,6 +40,7 @@ from restling_server.users.schemas import (
     ReissueInvitationResponse,
     ResetPasswordRequest,
     ResetPasswordResponse,
+    RestoreUserRequest,
     RevokeOtherSessionsData,
     RevokeOtherSessionsResponse,
     UserDetail,
@@ -55,6 +56,7 @@ from restling_server.users.service import (
     InvalidCredentialsError,
     InvalidPasswordResetTokenError,
     InvitationNotAllowedError,
+    LastAdministratorError,
     SessionLimitReachedError,
     SessionNotFoundError,
     UserAlreadyExistsError,
@@ -62,6 +64,8 @@ from restling_server.users.service import (
     UserDetailNotAllowedError,
     UserListingNotAllowedError,
     UserNotFoundError,
+    UserRestorationNotAllowedError,
+    UserSuspensionNotAllowedError,
     activate_user,
     authenticate_access_token,
     create_user,
@@ -72,9 +76,11 @@ from restling_server.users.service import (
     logout_session,
     refresh_session,
     reset_user_password,
+    restore_user,
     revoke_all_user_sessions,
     revoke_other_sessions,
     revoke_user_session,
+    suspend_user,
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
@@ -950,3 +956,150 @@ def reissue_user_invitation(
     response.headers["Cache-Control"] = "no-store"
 
     return ReissueInvitationResponse(invitation=invitation)
+
+
+@users_router.post(
+    "/{user_id}/suspend",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def suspend_user_account(
+    user_id: UUID,
+    credentials: LogoutCredentials,
+    session: DbSession,
+) -> Response | JSONResponse:
+    """Suspend an active account and revoke its sessions."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        with session.begin():
+            actor = authenticate_access_token(
+                session,
+                access_token=credentials.credentials,
+            )
+
+            actor_id = actor.id
+            is_administrator = (
+                actor.system_role == "administrator"
+                and actor.status == "active"
+                and not actor.password_reset_required
+            )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    if not is_administrator:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        suspend_user(
+            session,
+            actor_id=actor_id,
+            user_id=user_id,
+        )
+    except LastAdministratorError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "LAST_ADMINISTRATOR",
+                    "message": "The last active administrator cannot be suspended.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserSuspensionNotAllowedError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "SUSPENSION_NOT_ALLOWED",
+                    "message": "Account is not eligible for suspension.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return Response(
+        status_code=204,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@users_router.post(
+    "/{user_id}/restore",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def restore_user_account(
+    user_id: UUID,
+    payload: RestoreUserRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+) -> Response | JSONResponse:
+    """Restore a suspended account without reviving old sessions."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        with session.begin():
+            actor = authenticate_access_token(
+                session,
+                access_token=credentials.credentials,
+            )
+
+            actor_id = actor.id
+            is_administrator = (
+                actor.system_role == "administrator"
+                and actor.status == "active"
+                and not actor.password_reset_required
+            )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    if not is_administrator:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        restore_user(
+            session,
+            actor_id=actor_id,
+            user_id=user_id,
+            require_password_reset=payload.require_password_reset,
+        )
+    except UserRestorationNotAllowedError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "RESTORATION_NOT_ALLOWED",
+                    "message": "Account is not eligible for restoration.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return Response(
+        status_code=204,
+        headers={"Cache-Control": "no-store"},
+    )
