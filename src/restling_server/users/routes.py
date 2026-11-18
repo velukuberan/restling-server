@@ -52,6 +52,7 @@ from restling_server.users.schemas import (
     UserSummary,
 )
 from restling_server.users.service import (
+    AdministratorSessionAccessNotAllowedError,
     InvalidActivationTokenError,
     InvalidCredentialsError,
     InvalidPasswordResetTokenError,
@@ -70,6 +71,7 @@ from restling_server.users.service import (
     authenticate_access_token,
     create_user,
     get_user_detail,
+    list_administrator_user_sessions,
     list_user_session_history,
     list_users,
     login_user,
@@ -77,6 +79,8 @@ from restling_server.users.service import (
     refresh_session,
     reset_user_password,
     restore_user,
+    revoke_administrator_user_session,
+    revoke_administrator_user_sessions,
     revoke_all_user_sessions,
     revoke_other_sessions,
     revoke_user_session,
@@ -1094,6 +1098,208 @@ def restore_user_account(
                 "error": {
                     "code": "RESTORATION_NOT_ALLOWED",
                     "message": "Account is not eligible for restoration.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return Response(
+        status_code=204,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@users_router.get(
+    "/{user_id}/sessions",
+    response_model=UserSessionsResponse,
+    status_code=200,
+)
+def get_user_sessions_as_administrator(
+    user_id: UUID,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    request: Request,
+    response: Response,
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    status: Annotated[
+        Literal["active", "revoked", "expired"] | None,
+        Query(),
+    ] = None,
+) -> UserSessionsResponse | JSONResponse:
+    """List a user's session history as a system administrator."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    settings = cast(Settings, request.app.state.settings)
+
+    try:
+        result = list_administrator_user_sessions(
+            session,
+            access_token=credentials.credentials,
+            user_id=user_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+            retention_days=settings.session_history_retention_days,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except AdministratorSessionAccessNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return UserSessionsResponse(
+        data=[
+            UserSessionDetail(
+                session_id=item.session_id,
+                created_at=item.created_at,
+                expires_at=item.expires_at,
+                last_used_at=item.last_used_at,
+                revoked_at=item.revoked_at,
+                login_ip=item.login_ip,
+                last_seen_ip=item.last_seen_ip,
+                machine_name=item.machine_name,
+                status=item.status,
+                is_current=item.is_current,
+            )
+            for item in result.items
+        ],
+        pagination=PaginationDetail(
+            limit=limit,
+            offset=offset,
+            total=result.total,
+        ),
+    )
+
+
+@users_router.delete(
+    "/{user_id}/sessions/{session_id}",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def revoke_user_session_as_administrator(
+    user_id: UUID,
+    session_id: UUID,
+    credentials: LogoutCredentials,
+    session: DbSession,
+) -> Response | JSONResponse:
+    """Revoke one user's session as a system administrator."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        revoke_administrator_user_session(
+            session,
+            access_token=credentials.credentials,
+            user_id=user_id,
+            target_session_id=session_id,
+        )
+    except SessionNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "SESSION_NOT_FOUND",
+                    "message": "Session not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except AdministratorSessionAccessNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return Response(
+        status_code=204,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@users_router.delete(
+    "/{user_id}/sessions",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def revoke_all_user_sessions_as_administrator(
+    user_id: UUID,
+    credentials: LogoutCredentials,
+    session: DbSession,
+) -> Response | JSONResponse:
+    """Revoke all active sessions for a user as an administrator."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        revoke_administrator_user_sessions(
+            session,
+            access_token=credentials.credentials,
+            user_id=user_id,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except AdministratorSessionAccessNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
                 }
             },
             headers={"Cache-Control": "no-store"},

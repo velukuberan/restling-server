@@ -78,6 +78,10 @@ class SessionLimitReachedError(Exception):
     """The account has reached its active-session limit."""
 
 
+class AdministratorSessionAccessNotAllowedError(Exception):
+    """The actor cannot manage another user's sessions."""
+
+
 class PasswordResetNotAllowedError(Exception):
     """The actor cannot issue a password-reset credential."""
 
@@ -967,16 +971,17 @@ def list_user_sessions(
     ]
 
 
-def list_user_session_history(
+def _query_session_history(
     session: Session,
     *,
-    access_token: str,
-    status: SessionStatus | None = None,
-    limit: int = 25,
-    offset: int = 0,
-    retention_days: int = 30,
+    user_id: UUID,
+    current_session_id: UUID | None,
+    status: SessionStatus | None,
+    limit: int,
+    offset: int,
+    retention_days: int,
 ) -> SessionHistoryPage:
-    """List retained sessions owned by the authenticated user."""
+    """Query retained session history for an authorized account."""
     if not 1 <= limit <= 100:
         raise ValueError("Session page limit must be between 1 and 100.")
 
@@ -988,23 +993,6 @@ def list_user_session_history(
 
     if status not in (None, "active", "revoked", "expired"):
         raise ValueError("Invalid session status.")
-
-    user = authenticate_access_token(
-        session,
-        access_token=access_token,
-    )
-
-    current_session_id = session.scalar(
-        select(LoginSession.id)
-        .join(AccessToken, AccessToken.session_id == LoginSession.id)
-        .where(
-            AccessToken.token_hash == hash_token(access_token),
-            LoginSession.user_id == user.id,
-        )
-    )
-
-    if current_session_id is None:
-        raise InvalidCredentialsError("Invalid access credential.")
 
     now = datetime.now(UTC)
     cutoff = now - timedelta(days=retention_days)
@@ -1035,7 +1023,7 @@ def list_user_session_history(
         visibility = or_(active, revoked, expired)
 
     criteria = and_(
-        LoginSession.user_id == user.id,
+        LoginSession.user_id == user_id,
         visibility,
     )
 
@@ -1087,6 +1075,297 @@ def list_user_session_history(
         items=items,
         total=total if total is not None else 0,
     )
+
+
+def list_user_session_history(
+    session: Session,
+    *,
+    access_token: str,
+    status: SessionStatus | None = None,
+    limit: int = 25,
+    offset: int = 0,
+    retention_days: int = 30,
+) -> SessionHistoryPage:
+    """List retained sessions owned by the authenticated user."""
+    user = authenticate_access_token(
+        session,
+        access_token=access_token,
+    )
+
+    current_session_id = session.scalar(
+        select(LoginSession.id)
+        .join(AccessToken, AccessToken.session_id == LoginSession.id)
+        .where(
+            AccessToken.token_hash == hash_token(access_token),
+            LoginSession.user_id == user.id,
+        )
+    )
+
+    if current_session_id is None:
+        raise InvalidCredentialsError("Invalid access credential.")
+
+    return _query_session_history(
+        session,
+        user_id=user.id,
+        current_session_id=current_session_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+        retention_days=retention_days,
+    )
+
+
+def list_administrator_user_sessions(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+    status: SessionStatus | None = None,
+    limit: int = 25,
+    offset: int = 0,
+    retention_days: int = 30,
+) -> SessionHistoryPage:
+    """List retained sessions for a user as a system administrator."""
+    actor = authenticate_access_token(
+        session,
+        access_token=access_token,
+    )
+
+    if (
+        actor.system_role != "administrator"
+        or actor.status != "active"
+        or actor.password_reset_required
+    ):
+        raise AdministratorSessionAccessNotAllowedError(
+            "Administrator privileges are required."
+        )
+
+    target = session.get(User, user_id)
+
+    if target is None:
+        raise UserNotFoundError("User account not found.")
+
+    current_session_id: UUID | None = None
+
+    if actor.id == user_id:
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(
+                AccessToken.token_hash == hash_token(access_token),
+                LoginSession.user_id == actor.id,
+            )
+        )
+
+        if current_session_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+    return _query_session_history(
+        session,
+        user_id=user_id,
+        current_session_id=current_session_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+        retention_days=retention_days,
+    )
+
+
+def revoke_administrator_user_session(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+    target_session_id: UUID,
+) -> None:
+    """Revoke one user's session as a system administrator."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Acquire account locks in a consistent order.
+        locked_users = session.scalars(
+            select(User)
+            .where(User.id.in_([actor_id, user_id]))
+            .order_by(User.id)
+            .with_for_update()
+        ).all()
+
+        users_by_id = {user.id: user for user in locked_users}
+        actor = users_by_id.get(actor_id)
+        target_user = users_by_id.get(user_id)
+
+        if actor is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate the credential after acquiring account locks.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(
+                LoginSession.user_id == actor.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or actor.status != "active"
+            or actor.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if actor.system_role != "administrator":
+            raise AdministratorSessionAccessNotAllowedError(
+                "Administrator privileges are required."
+            )
+
+        if target_user is None:
+            raise UserNotFoundError("User account not found.")
+
+        target_session = session.scalar(
+            select(LoginSession)
+            .where(
+                LoginSession.id == target_session_id,
+                LoginSession.user_id == target_user.id,
+            )
+            .with_for_update()
+        )
+
+        if target_session is None:
+            raise SessionNotFoundError("Session not found.")
+
+        # Preserve historical state on repeated requests.
+        if target_session.revoked_at is not None or target_session.expires_at <= now:
+            return
+
+        target_session.refresh_token_hash = None
+        target_session.revoked_at = now
+        target_session.revocation_reason = "administrator_revoked"
+
+        session.add(
+            AuditLog(
+                actor_user_id=actor.id,
+                target_user_id=target_user.id,
+                action="user.session.revoked",
+                event_metadata={
+                    "session_id": str(target_session.id),
+                },
+            )
+        )
+
+        session.flush()
+
+
+def revoke_administrator_user_sessions(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+) -> None:
+    """Revoke all active sessions for a user as an administrator."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Lock both accounts in a consistent order.
+        locked_users = session.scalars(
+            select(User)
+            .where(User.id.in_([actor_id, user_id]))
+            .order_by(User.id)
+            .with_for_update()
+        ).all()
+
+        users_by_id = {user.id: user for user in locked_users}
+        actor = users_by_id.get(actor_id)
+        target_user = users_by_id.get(user_id)
+
+        if actor is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate credentials after acquiring account locks.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(
+                LoginSession.user_id == actor.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or actor.status != "active"
+            or actor.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if actor.system_role != "administrator":
+            raise AdministratorSessionAccessNotAllowedError(
+                "Administrator privileges are required."
+            )
+
+        if target_user is None:
+            raise UserNotFoundError("User account not found.")
+
+        # Lock active sessions in deterministic order.
+        active_sessions = session.scalars(
+            select(LoginSession)
+            .where(
+                LoginSession.user_id == target_user.id,
+                LoginSession.revoked_at.is_(None),
+                LoginSession.expires_at > now,
+            )
+            .order_by(LoginSession.id)
+            .with_for_update()
+        ).all()
+
+        if not active_sessions:
+            return
+
+        for active_session in active_sessions:
+            active_session.refresh_token_hash = None
+            active_session.revoked_at = now
+            active_session.revocation_reason = "administrator_revoked"
+
+        session.add(
+            AuditLog(
+                actor_user_id=actor.id,
+                target_user_id=target_user.id,
+                action="user.sessions.revoked",
+                event_metadata={
+                    "revoked_count": len(active_sessions),
+                },
+            )
+        )
+
+        session.flush()
 
 
 def revoke_user_session(
