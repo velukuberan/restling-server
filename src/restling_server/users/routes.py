@@ -43,8 +43,11 @@ from restling_server.users.service import (
     InvalidPasswordResetTokenError,
     SessionLimitReachedError,
     SessionNotFoundError,
+    UserDetailNotAllowedError,
     UserListingNotAllowedError,
+    UserNotFoundError,
     activate_user,
+    get_user_detail,
     list_user_session_history,
     list_users,
     login_user,
@@ -552,4 +555,52 @@ def get_users(
             offset=offset,
             total=total,
         ),
+    )
+
+
+@users_router.get(
+    "/{user_id}",
+    response_model=UserDetailResponse,
+    status_code=200,
+)
+def get_user_by_id(
+    user_id: UUID,
+    current_user: CurrentUser,
+    session: DbSession,
+    response: Response,
+) -> UserDetailResponse | JSONResponse:
+    """Retrieve user account details as an administrator."""
+    try:
+        user = get_user_detail(
+            session,
+            actor=current_user,
+            user_id=user_id,
+        )
+    except UserDetailNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return UserDetailResponse(
+        data=UserDetail.model_validate(user),
     )

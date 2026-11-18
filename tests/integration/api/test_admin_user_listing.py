@@ -220,3 +220,126 @@ def test_listing_rejects_invalid_query_parameters(
         )
 
         assert response.status_code == 422
+
+
+def test_administrator_can_get_user_detail(
+    api_client: TestClient,
+    accounts: tuple[str, str, str, list[UUID]],
+) -> None:
+    """An administrator can retrieve an existing user's details."""
+    admin_token, _, _, user_ids = accounts
+    user_id = user_ids[0]
+
+    response = api_client.get(
+        f"/api/v1/users/{user_id}",
+        headers=auth(admin_token),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+
+    user = response.json()["data"]
+
+    assert user["id"] == str(user_id)
+    assert user["display_name"] == "Alpha"
+    assert user["status"] == "active"
+    assert user["system_role"] == "user"
+    assert user["password_reset_required"] is False
+
+    assert "password_hash" not in user
+    assert "normalized_email" not in user
+    assert "refresh_token" not in user
+
+
+def test_administrator_can_get_pending_user_detail(
+    api_client: TestClient,
+    accounts: tuple[str, str, str, list[UUID]],
+) -> None:
+    """Pending account details remain accessible to administrators."""
+    admin_token, _, _, user_ids = accounts
+
+    response = api_client.get(
+        f"/api/v1/users/{user_ids[1]}",
+        headers=auth(admin_token),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "pending"
+    assert response.json()["data"]["activated_at"] is None
+
+
+def test_user_detail_requires_authentication(
+    api_client: TestClient,
+    accounts: tuple[str, str, str, list[UUID]],
+) -> None:
+    """Missing and invalid credentials are rejected."""
+    _, _, _, user_ids = accounts
+
+    for headers in ({}, auth("invalid-token")):
+        response = api_client.get(
+            f"/api/v1/users/{user_ids[0]}",
+            headers=headers,
+        )
+
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+def test_regular_user_cannot_get_account_details(
+    api_client: TestClient,
+    accounts: tuple[str, str, str, list[UUID]],
+) -> None:
+    """An ordinary user cannot inspect accounts through the admin API."""
+    _, prefix, password, user_ids = accounts
+
+    login = api_client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": f"{prefix}-alpha@example.com",
+            "password": password,
+        },
+    )
+
+    assert login.status_code == 200
+    token = login.json()["data"]["access_token"]
+
+    for user_id in (user_ids[0], user_ids[1], uuid7()):
+        response = api_client.get(
+            f"/api/v1/users/{user_id}",
+            headers=auth(token),
+        )
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "FORBIDDEN"
+
+
+def test_administrator_get_unknown_user_returns_404(
+    api_client: TestClient,
+    accounts: tuple[str, str, str, list[UUID]],
+) -> None:
+    """An unknown account returns a consistent not-found error."""
+    admin_token, _, _, _ = accounts
+
+    response = api_client.get(
+        f"/api/v1/users/{uuid7()}",
+        headers=auth(admin_token),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "USER_NOT_FOUND"
+
+
+def test_user_detail_rejects_invalid_uuid(
+    api_client: TestClient,
+    accounts: tuple[str, str, str, list[UUID]],
+) -> None:
+    """Malformed account identifiers are rejected."""
+    admin_token, _, _, _ = accounts
+
+    response = api_client.get(
+        "/api/v1/users/not-a-uuid",
+        headers=auth(admin_token),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"

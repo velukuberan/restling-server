@@ -90,6 +90,14 @@ class UserSuspensionNotAllowedError(Exception):
     """The actor or target account is not eligible for suspension."""
 
 
+class UserDetailNotAllowedError(Exception):
+    """The actor cannot view another user's account details."""
+
+
+class UserNotFoundError(Exception):
+    """The requested account does not exist."""
+
+
 class LastAdministratorError(Exception):
     """The operation would leave no active system administrator."""
 
@@ -1512,3 +1520,25 @@ def list_users(
     ).all()
 
     return list(users), total or 0
+
+
+def get_user_detail(
+    session: Session,
+    *,
+    actor: User,
+    user_id: UUID,
+) -> User:
+    """Retrieve a user account as a system administrator."""
+    if (
+        actor.system_role != "administrator"
+        or actor.status != "active"
+        or actor.password_reset_required
+    ):
+        raise UserDetailNotAllowedError("Administrator privileges are required.")
+
+    user = session.get(User, user_id)
+
+    if user is None:
+        raise UserNotFoundError("User account not found.")
+
+    return user
