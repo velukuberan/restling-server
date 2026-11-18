@@ -56,6 +56,33 @@ class UserDetailResponse(BaseModel):
     data: UserDetail
 
 
+class CreateUserRequest(BaseModel):
+    """Administrator request to create a pending account."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=1)
+    display_name: str = Field(min_length=1)
+    job_title: str | None = None
+    system_role: Literal["user"] = "user"
+    invitation_delivery: Literal["email", "manual"] | None = None
+
+
+class UserInvitationDetail(BaseModel):
+    """Delivery result for the new account invitation."""
+
+    delivery: Literal["email", "manual"]
+    expires_at: datetime
+    activation_url: str | None = None
+
+
+class CreateUserResponse(BaseModel):
+    """New account and its activation invitation result."""
+
+    data: UserDetail
+    invitation: UserInvitationDetail
+
+
 class LoginRequest(BaseModel):
     """Credentials submitted for password authentication."""
 

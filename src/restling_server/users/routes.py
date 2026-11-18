@@ -17,10 +17,20 @@ from sqlalchemy.orm import Session
 
 from restling_server.core.config import Settings
 from restling_server.core.dependencies import get_db_session
+from restling_server.users.activation_links import (
+    ActivationURLNotConfiguredError,
+)
 from restling_server.users.dependencies import CurrentUser
+from restling_server.users.invitation_email import InvitationDeliveryError
+from restling_server.users.invitations import (
+    deliver_activation_invitation,
+    prepare_activation_invitation,
+)
 from restling_server.users.schemas import (
     ActivateUserRequest,
     ActivateUserResponse,
+    CreateUserRequest,
+    CreateUserResponse,
     LoginRequest,
     LoginResponse,
     LoginTokenData,
@@ -32,6 +42,7 @@ from restling_server.users.schemas import (
     RevokeOtherSessionsResponse,
     UserDetail,
     UserDetailResponse,
+    UserInvitationDetail,
     UserSessionDetail,
     UserSessionsResponse,
     UsersResponse,
@@ -43,10 +54,14 @@ from restling_server.users.service import (
     InvalidPasswordResetTokenError,
     SessionLimitReachedError,
     SessionNotFoundError,
+    UserAlreadyExistsError,
+    UserCreationNotAllowedError,
     UserDetailNotAllowedError,
     UserListingNotAllowedError,
     UserNotFoundError,
     activate_user,
+    authenticate_access_token,
+    create_user,
     get_user_detail,
     list_user_session_history,
     list_users,
@@ -603,4 +618,172 @@ def get_user_by_id(
 
     return UserDetailResponse(
         data=UserDetail.model_validate(user),
+    )
+
+
+@users_router.post(
+    "",
+    response_model=CreateUserResponse,
+    status_code=201,
+)
+def create_user_account(
+    payload: CreateUserRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    request: Request,
+    response: Response,
+) -> CreateUserResponse | JSONResponse:
+    """Create a pending user and issue an activation invitation."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        with session.begin():
+            actor = authenticate_access_token(
+                session,
+                access_token=credentials.credentials,
+            )
+            actor_id = actor.id
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    if (
+        actor.system_role != "administrator"
+        or actor.status != "active"
+        or actor.password_reset_required
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    settings = cast(Settings, request.app.state.settings)
+
+    if settings.public_url is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "INVITATION_UNAVAILABLE",
+                    "message": "Account invitations are not configured.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    delivery = payload.invitation_delivery
+
+    if delivery is None:
+        delivery = "email" if settings.smtp_host is not None else "manual"
+
+    if delivery == "email" and (
+        settings.smtp_host is None or settings.smtp_from_email is None
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "INVITATION_UNAVAILABLE",
+                    "message": "SMTP invitation delivery is not configured.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        user = create_user(
+            session,
+            actor_id=actor_id,
+            email=payload.email,
+            display_name=payload.display_name,
+            job_title=payload.job_title,
+        )
+    except UserCreationNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserAlreadyExistsError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "EMAIL_ALREADY_EXISTS",
+                    "message": "A user with this email already exists.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "VALIDATION_ERROR",
+                    "message": "Invalid user account data.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # Account creation has committed. Invitation delivery
+    # is handled separately, including SMTP communication.
+    try:
+        if delivery == "manual":
+            activation_url, expires_at = prepare_activation_invitation(
+                session,
+                settings=settings,
+                actor_id=actor_id,
+                user_id=user.id,
+            )
+
+            invitation = UserInvitationDetail(
+                delivery="manual",
+                expires_at=expires_at,
+                activation_url=activation_url,
+            )
+        else:
+            expires_at = deliver_activation_invitation(
+                session,
+                settings=settings,
+                actor_id=actor_id,
+                user_id=user.id,
+            )
+
+            invitation = UserInvitationDetail(
+                delivery="email",
+                expires_at=expires_at,
+            )
+    except (ActivationURLNotConfiguredError, InvitationDeliveryError):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "INVITATION_DELIVERY_FAILED",
+                    "message": (
+                        "Account created, but invitation delivery failed. "
+                        "The invitation must be reissued."
+                    ),
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return CreateUserResponse(
+        data=UserDetail.model_validate(user),
+        invitation=invitation,
     )

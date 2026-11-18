@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
+from restling_server.core.database import create_session_factory
 from restling_server.core.dependencies import get_db_session
 from restling_server.main import app
 
@@ -15,8 +16,10 @@ from restling_server.main import app
 def api_client(test_engine: Engine) -> Iterator[TestClient]:
     """Provide an HTTP client connected to the verified test database."""
 
+    session_factory = create_session_factory(test_engine)
+
     def override_db_session() -> Iterator[Session]:
-        with Session(test_engine) as session:
+        with session_factory() as session:
             yield session
 
     app.dependency_overrides[get_db_session] = override_db_session
