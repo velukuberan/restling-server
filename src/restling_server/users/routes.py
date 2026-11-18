@@ -34,6 +34,8 @@ from restling_server.users.schemas import (
     UserDetailResponse,
     UserSessionDetail,
     UserSessionsResponse,
+    UsersResponse,
+    UserSummary,
 )
 from restling_server.users.service import (
     InvalidActivationTokenError,
@@ -41,8 +43,10 @@ from restling_server.users.service import (
     InvalidPasswordResetTokenError,
     SessionLimitReachedError,
     SessionNotFoundError,
+    UserListingNotAllowedError,
     activate_user,
     list_user_session_history,
+    list_users,
     login_user,
     logout_session,
     refresh_session,
@@ -489,4 +493,63 @@ def revoke_my_all_sessions(
     return Response(
         status_code=204,
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@users_router.get(
+    "",
+    response_model=UsersResponse,
+    status_code=200,
+)
+def get_users(
+    current_user: CurrentUser,
+    session: DbSession,
+    response: Response,
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    status: Annotated[
+        Literal["pending", "active", "suspended"] | None,
+        Query(),
+    ] = None,
+    system_role: Annotated[
+        Literal["administrator", "user"] | None,
+        Query(),
+    ] = None,
+    search: str | None = None,
+    sort_by: Literal["created_at", "email", "display_name", "status"] = "created_at",
+    sort_order: Literal["asc", "desc"] = "desc",
+) -> UsersResponse | JSONResponse:
+    """List user accounts for a system administrator."""
+    try:
+        users, total = list_users(
+            session,
+            actor=current_user,
+            limit=limit,
+            offset=offset,
+            status=status,
+            system_role=system_role,
+            search=search,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+    except UserListingNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return UsersResponse(
+        data=[UserSummary.model_validate(user) for user in users],
+        pagination=PaginationDetail(
+            limit=limit,
+            offset=offset,
+            total=total,
+        ),
     )

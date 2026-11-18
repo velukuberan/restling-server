@@ -113,6 +113,27 @@ class PaginationDetail(BaseModel):
     total: int
 
 
+class UserSummary(BaseModel):
+    """Safe account fields exposed in administrator listings."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    email: str
+    display_name: str
+    job_title: str | None
+    status: str
+    system_role: str
+    created_at: datetime
+
+
+class UsersResponse(BaseModel):
+    """Paginated administrator user listing."""
+
+    data: list[UserSummary]
+    pagination: PaginationDetail
+
+
 class UserSessionsResponse(BaseModel):
     """Paginated session history response."""
 

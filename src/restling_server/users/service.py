@@ -17,6 +17,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from restling_server.users.models import (
     AccessToken,
@@ -51,6 +52,10 @@ class UserCreationNotAllowedError(Exception):
 
 class UserAlreadyExistsError(Exception):
     """A user account with this email already exists."""
+
+
+class UserListingNotAllowedError(Exception):
+    """The actor cannot list server accounts."""
 
 
 class InvitationNotAllowedError(Exception):
@@ -1440,3 +1445,70 @@ def restore_user(
         )
 
         session.flush()
+
+
+def list_users(
+    session: Session,
+    *,
+    actor: User,
+    limit: int,
+    offset: int,
+    status: str | None = None,
+    system_role: str | None = None,
+    search: str | None = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
+) -> tuple[list[User], int]:
+    """List accounts visible to a system administrator."""
+    if (
+        actor.system_role != "administrator"
+        or actor.status != "active"
+        or actor.password_reset_required
+    ):
+        raise UserListingNotAllowedError("Administrator privileges are required.")
+
+    filters: list[ColumnElement[bool]] = []
+
+    if status is not None:
+        filters.append(User.status == status)
+
+    if system_role is not None:
+        filters.append(User.system_role == system_role)
+
+    if search is not None and search.strip():
+        pattern = (
+            "%"
+            + search.strip()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+            + "%"
+        )
+        filters.append(
+            or_(
+                User.email.ilike(pattern, escape="\\"),
+                User.display_name.ilike(pattern, escape="\\"),
+            )
+        )
+
+    sort_columns = {
+        "created_at": User.created_at,
+        "email": User.email,
+        "display_name": User.display_name,
+        "status": User.status,
+    }
+
+    column = sort_columns[sort_by]
+
+    if sort_order == "asc":
+        ordering = (column.asc(), User.id.asc())
+    else:
+        ordering = (column.desc(), User.id.desc())
+
+    total = session.scalar(select(func.count()).select_from(User).where(*filters))
+
+    users = session.scalars(
+        select(User).where(*filters).order_by(*ordering).limit(limit).offset(offset)
+    ).all()
+
+    return list(users), total or 0
