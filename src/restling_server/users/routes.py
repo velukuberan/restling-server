@@ -36,6 +36,8 @@ from restling_server.users.schemas import (
     LoginTokenData,
     PaginationDetail,
     RefreshTokenRequest,
+    ReissueInvitationRequest,
+    ReissueInvitationResponse,
     ResetPasswordRequest,
     ResetPasswordResponse,
     RevokeOtherSessionsData,
@@ -52,6 +54,7 @@ from restling_server.users.service import (
     InvalidActivationTokenError,
     InvalidCredentialsError,
     InvalidPasswordResetTokenError,
+    InvitationNotAllowedError,
     SessionLimitReachedError,
     SessionNotFoundError,
     UserAlreadyExistsError,
@@ -787,3 +790,163 @@ def create_user_account(
         data=UserDetail.model_validate(user),
         invitation=invitation,
     )
+
+
+@users_router.post(
+    "/{user_id}/invitations",
+    response_model=ReissueInvitationResponse,
+    status_code=200,
+)
+def reissue_user_invitation(
+    user_id: UUID,
+    payload: ReissueInvitationRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    request: Request,
+    response: Response,
+) -> ReissueInvitationResponse | JSONResponse:
+    """Reissue an activation invitation for a pending account."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        with session.begin():
+            actor = authenticate_access_token(
+                session,
+                access_token=credentials.credentials,
+            )
+
+            actor_id = actor.id
+            is_administrator = (
+                actor.system_role == "administrator"
+                and actor.status == "active"
+                and not actor.password_reset_required
+            )
+
+            if is_administrator:
+                try:
+                    target = get_user_detail(
+                        session,
+                        actor=actor,
+                        user_id=user_id,
+                    )
+                    target_status = target.status
+                except UserNotFoundError:
+                    target_status = None
+            else:
+                target_status = None
+
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    if not is_administrator:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    if target_status is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    if target_status != "pending":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "INVITATION_NOT_ALLOWED",
+                    "message": "Account is not eligible for an invitation.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    settings = cast(Settings, request.app.state.settings)
+
+    delivery = payload.invitation_delivery
+
+    if delivery is None:
+        delivery = "email" if settings.smtp_host is not None else "manual"
+
+    if settings.public_url is None or (
+        delivery == "email"
+        and (settings.smtp_host is None or settings.smtp_from_email is None)
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "INVITATION_UNAVAILABLE",
+                    "message": "Requested invitation delivery is not configured.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        if delivery == "manual":
+            activation_url, expires_at = prepare_activation_invitation(
+                session,
+                settings=settings,
+                actor_id=actor_id,
+                user_id=user_id,
+            )
+
+            invitation = UserInvitationDetail(
+                delivery="manual",
+                expires_at=expires_at,
+                activation_url=activation_url,
+            )
+        else:
+            expires_at = deliver_activation_invitation(
+                session,
+                settings=settings,
+                actor_id=actor_id,
+                user_id=user_id,
+            )
+
+            invitation = UserInvitationDetail(
+                delivery="email",
+                expires_at=expires_at,
+            )
+
+    except InvitationNotAllowedError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "INVITATION_NOT_ALLOWED",
+                    "message": "Account is no longer eligible for an invitation.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except (ActivationURLNotConfiguredError, InvitationDeliveryError):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "INVITATION_DELIVERY_FAILED",
+                    "message": "Invitation could not be delivered. Reissue may be required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return ReissueInvitationResponse(invitation=invitation)

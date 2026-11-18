@@ -83,6 +83,20 @@ class CreateUserResponse(BaseModel):
     invitation: UserInvitationDetail
 
 
+class ReissueInvitationRequest(BaseModel):
+    """Administrator request to reissue an account invitation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    invitation_delivery: Literal["email", "manual"] | None = None
+
+
+class ReissueInvitationResponse(BaseModel):
+    """Result of reissuing an activation invitation."""
+
+    invitation: UserInvitationDetail
+
+
 class LoginRequest(BaseModel):
     """Credentials submitted for password authentication."""
 
