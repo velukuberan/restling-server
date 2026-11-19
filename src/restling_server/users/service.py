@@ -62,6 +62,14 @@ class InvitationNotAllowedError(Exception):
     """The invitation cannot be issued for this actor or account."""
 
 
+class InvitationRevocationNotAllowedError(Exception):
+    """The actor or account is not eligible for invitation revocation."""
+
+
+class InvitationRevocationAccessDeniedError(Exception):
+    """The actor cannot revoke account invitations."""
+
+
 class InvalidActivationTokenError(Exception):
     """The activation credential is invalid or no longer usable."""
 
@@ -368,6 +376,108 @@ def issue_activation_token(
         session.flush()
 
     return raw_token, expires_at
+
+
+def revoke_user_invitations(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+) -> None:
+    """Revoke outstanding activation invitations for a pending account."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Lock accounts in a consistent order.
+        locked_users = session.scalars(
+            select(User)
+            .where(User.id.in_([actor_id, user_id]))
+            .order_by(User.id)
+            .with_for_update()
+        ).all()
+
+        users_by_id = {user.id: user for user in locked_users}
+        actor = users_by_id.get(actor_id)
+        target = users_by_id.get(user_id)
+
+        if actor is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate authentication after acquiring account locks.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(
+                LoginSession.user_id == actor.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or actor.status != "active"
+            or actor.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if actor.system_role != "administrator":
+            raise InvitationRevocationAccessDeniedError(
+                "Administrator privileges are required."
+            )
+
+        if target is None:
+            raise UserNotFoundError("User account not found.")
+
+        if target.status != "pending":
+            raise InvitationRevocationNotAllowedError(
+                "Account is not eligible for invitation revocation."
+            )
+
+        # Serialize revocation with activation and invitation reissuance.
+        invitations = session.scalars(
+            select(OneTimeToken)
+            .where(
+                OneTimeToken.user_id == target.id,
+                OneTimeToken.purpose == "account_activation",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+            .order_by(OneTimeToken.id)
+            .with_for_update()
+        ).all()
+
+        if not invitations:
+            return
+
+        for invitation in invitations:
+            invitation.revoked_at = now
+
+        session.add(
+            AuditLog(
+                actor_user_id=actor.id,
+                target_user_id=target.id,
+                action="user.invitations.revoked",
+                event_metadata={
+                    "revoked_count": len(invitations),
+                },
+            )
+        )
+
+        session.flush()
 
 
 def issue_password_reset_token(

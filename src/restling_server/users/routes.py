@@ -57,6 +57,8 @@ from restling_server.users.service import (
     InvalidCredentialsError,
     InvalidPasswordResetTokenError,
     InvitationNotAllowedError,
+    InvitationRevocationAccessDeniedError,
+    InvitationRevocationNotAllowedError,
     LastAdministratorError,
     SessionLimitReachedError,
     SessionNotFoundError,
@@ -83,6 +85,7 @@ from restling_server.users.service import (
     revoke_administrator_user_sessions,
     revoke_all_user_sessions,
     revoke_other_sessions,
+    revoke_user_invitations,
     revoke_user_session,
     suspend_user,
 )
@@ -960,6 +963,69 @@ def reissue_user_invitation(
     response.headers["Cache-Control"] = "no-store"
 
     return ReissueInvitationResponse(invitation=invitation)
+
+
+@users_router.delete(
+    "/{user_id}/invitations",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def revoke_user_invitations_as_administrator(
+    user_id: UUID,
+    credentials: LogoutCredentials,
+    session: DbSession,
+) -> Response | JSONResponse:
+    """Revoke outstanding activation invitations for a pending user."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        revoke_user_invitations(
+            session,
+            access_token=credentials.credentials,
+            user_id=user_id,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except InvitationRevocationAccessDeniedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except InvitationRevocationNotAllowedError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "INVITATION_REVOCATION_NOT_ALLOWED",
+                    "message": "Account is not eligible for invitation revocation.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return Response(
+        status_code=204,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @users_router.post(
