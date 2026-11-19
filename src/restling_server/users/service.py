@@ -110,6 +110,14 @@ class UserNotFoundError(Exception):
     """The requested account does not exist."""
 
 
+class ProfileUpdateNotAllowedError(Exception):
+    """The account is not eligible for self-service profile updates."""
+
+
+class AdministratorProfileUpdateNotAllowedError(Exception):
+    """The actor cannot update another user's profile."""
+
+
 class LastAdministratorError(Exception):
     """The operation would leave no active system administrator."""
 
@@ -1931,3 +1939,218 @@ def get_user_detail(
         raise UserNotFoundError("User account not found.")
 
     return user
+
+
+def _apply_profile_changes(
+    user: User,
+    changes: dict[str, str | None],
+) -> list[str]:
+    """Validate and apply editable profile fields."""
+    allowed_fields = {"display_name", "job_title"}
+
+    if not changes.keys() <= allowed_fields:
+        raise ValueError("Unsupported profile field.")
+
+    normalized_changes: dict[str, str | None] = {}
+
+    if "display_name" in changes:
+        display_name = changes["display_name"]
+
+        if display_name is None:
+            raise ValueError("Display name cannot be null.")
+
+        display_name = display_name.strip()
+
+        if not display_name:
+            raise ValueError("Display name is required.")
+
+        if len(display_name) > 150:
+            raise ValueError("Display name must not exceed 150 characters.")
+
+        normalized_changes["display_name"] = display_name
+
+    if "job_title" in changes:
+        job_title = changes["job_title"]
+
+        if job_title is not None:
+            job_title = job_title.strip()
+
+            if len(job_title) > 100:
+                raise ValueError("Job title must not exceed 100 characters.")
+
+            job_title = job_title or None
+
+        normalized_changes["job_title"] = job_title
+
+    changed_fields: list[str] = []
+
+    if "display_name" in normalized_changes:
+        display_name = normalized_changes["display_name"]
+
+        if display_name is not None and user.display_name != display_name:
+            user.display_name = display_name
+            changed_fields.append("display_name")
+
+    if "job_title" in normalized_changes:
+        job_title = normalized_changes["job_title"]
+
+        if user.job_title != job_title:
+            user.job_title = job_title
+            changed_fields.append("job_title")
+
+    return changed_fields
+
+
+def update_own_profile(
+    session: Session,
+    *,
+    access_token: str,
+    changes: dict[str, str | None],
+) -> User:
+    """Update the authenticated user's editable profile fields."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        user = session.scalar(select(User).where(User.id == actor_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if current_session_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if user.status != "active" or user.password_reset_required:
+            raise ProfileUpdateNotAllowedError(
+                "Account is not eligible for profile updates."
+            )
+
+        changed_fields = _apply_profile_changes(user, changes)
+
+        if changed_fields:
+            session.add(
+                AuditLog(
+                    actor_user_id=user.id,
+                    target_user_id=user.id,
+                    action="user.profile.updated",
+                    event_metadata={
+                        "changed_fields": changed_fields,
+                    },
+                )
+            )
+
+            session.flush()
+
+    return user
+
+
+def update_user_profile_as_administrator(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+    changes: dict[str, str | None],
+) -> User:
+    """Update a user's editable profile fields as an administrator."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Lock actor and target accounts in a consistent order.
+        locked_users = session.scalars(
+            select(User)
+            .where(User.id.in_([actor_id, user_id]))
+            .order_by(User.id)
+            .with_for_update()
+        ).all()
+
+        users_by_id = {user.id: user for user in locked_users}
+        actor = users_by_id.get(actor_id)
+        target = users_by_id.get(user_id)
+
+        if actor is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate authentication after acquiring account locks.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(
+                LoginSession.user_id == actor.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or actor.status != "active"
+            or actor.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if actor.system_role != "administrator":
+            raise AdministratorProfileUpdateNotAllowedError(
+                "Administrator privileges are required."
+            )
+
+        if target is None:
+            raise UserNotFoundError("User account not found.")
+
+        changed_fields = _apply_profile_changes(target, changes)
+
+        if changed_fields:
+            session.add(
+                AuditLog(
+                    actor_user_id=actor.id,
+                    target_user_id=target.id,
+                    action="user.profile.updated",
+                    event_metadata={
+                        "changed_fields": changed_fields,
+                    },
+                )
+            )
+
+            session.flush()
+
+    return target

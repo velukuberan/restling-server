@@ -43,6 +43,7 @@ from restling_server.users.schemas import (
     RestoreUserRequest,
     RevokeOtherSessionsData,
     RevokeOtherSessionsResponse,
+    UpdateUserProfileRequest,
     UserDetail,
     UserDetailResponse,
     UserInvitationDetail,
@@ -52,6 +53,7 @@ from restling_server.users.schemas import (
     UserSummary,
 )
 from restling_server.users.service import (
+    AdministratorProfileUpdateNotAllowedError,
     AdministratorSessionAccessNotAllowedError,
     InvalidActivationTokenError,
     InvalidCredentialsError,
@@ -60,6 +62,7 @@ from restling_server.users.service import (
     InvitationRevocationAccessDeniedError,
     InvitationRevocationNotAllowedError,
     LastAdministratorError,
+    ProfileUpdateNotAllowedError,
     SessionLimitReachedError,
     SessionNotFoundError,
     UserAlreadyExistsError,
@@ -88,6 +91,8 @@ from restling_server.users.service import (
     revoke_user_invitations,
     revoke_user_session,
     suspend_user,
+    update_own_profile,
+    update_user_profile_as_administrator,
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
@@ -209,6 +214,50 @@ def get_my_profile(
     """Return the authenticated user's profile."""
     return UserDetailResponse(
         data=UserDetail.model_validate(current_user),
+    )
+
+
+@users_router.patch(
+    "/me",
+    response_model=UserDetailResponse,
+    status_code=200,
+)
+def update_my_profile(
+    payload: UpdateUserProfileRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    response: Response,
+) -> UserDetailResponse | JSONResponse:
+    """Update the authenticated user's editable profile fields."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    changes = payload.model_dump(exclude_unset=True)
+
+    try:
+        user = update_own_profile(
+            session,
+            access_token=credentials.credentials,
+            changes=changes,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except ProfileUpdateNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "PROFILE_UPDATE_NOT_ALLOWED",
+                    "message": "Account is not eligible for profile updates.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return UserDetailResponse(
+        data=UserDetail.model_validate(user),
     )
 
 
@@ -608,6 +657,63 @@ def get_user_by_id(
             user_id=user_id,
         )
     except UserDetailNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return UserDetailResponse(
+        data=UserDetail.model_validate(user),
+    )
+
+
+@users_router.patch(
+    "/{user_id}",
+    response_model=UserDetailResponse,
+    status_code=200,
+)
+def update_user_profile_as_administrator_route(
+    user_id: UUID,
+    payload: UpdateUserProfileRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    response: Response,
+) -> UserDetailResponse | JSONResponse:
+    """Update a user's editable profile fields as an administrator."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    changes = payload.model_dump(exclude_unset=True)
+
+    try:
+        user = update_user_profile_as_administrator(
+            session,
+            access_token=credentials.credentials,
+            user_id=user_id,
+            changes=changes,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except AdministratorProfileUpdateNotAllowedError:
         return JSONResponse(
             status_code=403,
             content={

@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ActivateUserRequest(BaseModel):
@@ -54,6 +54,46 @@ class UserDetailResponse(BaseModel):
     """Response envelope for an individual user."""
 
     data: UserDetail
+
+
+class UpdateUserProfileRequest(BaseModel):
+    """Fields allowed in a user profile update."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None = None
+    job_title: str | None = None
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str | None) -> str:
+        """Validate and normalize an explicitly supplied display name."""
+        if value is None:
+            raise ValueError("Display name cannot be null.")
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError("Display name is required.")
+
+        if len(normalized) > 150:
+            raise ValueError("Display name must not exceed 150 characters.")
+
+        return normalized
+
+    @field_validator("job_title")
+    @classmethod
+    def validate_job_title(cls, value: str | None) -> str | None:
+        """Validate and normalize an explicitly supplied job title."""
+        if value is None:
+            return None
+
+        normalized = value.strip()
+
+        if len(normalized) > 100:
+            raise ValueError("Job title must not exceed 100 characters.")
+
+        return normalized or None
 
 
 class CreateUserRequest(BaseModel):
