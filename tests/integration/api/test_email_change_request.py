@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import AnyHttpUrl
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 from uuid6 import uuid7
@@ -611,6 +612,11 @@ def test_successful_email_change_request_issues_token(
     assert login.status_code == 200
 
     settings = cast(Settings, app.state.settings)
+    monkeypatch.setattr(
+        settings,
+        "public_url",
+        AnyHttpUrl("https://restling.example.com"),
+    )
     monkeypatch.setattr(settings, "smtp_host", "127.0.0.1")
     monkeypatch.setattr(settings, "smtp_from_email", "no-reply@example.com")
     monkeypatch.setattr(settings, "smtp_security", "none")
@@ -704,6 +710,11 @@ def test_successful_email_change_replaces_previous_token(
     assert login.status_code == 200
 
     settings = cast(Settings, app.state.settings)
+    monkeypatch.setattr(
+        settings,
+        "public_url",
+        AnyHttpUrl("https://restling.example.com"),
+    )
     monkeypatch.setattr(settings, "smtp_host", "127.0.0.1")
     monkeypatch.setattr(settings, "smtp_from_email", "no-reply@example.com")
     monkeypatch.setattr(settings, "smtp_security", "none")
@@ -789,6 +800,11 @@ def test_email_change_enforces_cooldown(
     assert login.status_code == 200
 
     settings = cast(Settings, app.state.settings)
+    monkeypatch.setattr(
+        settings,
+        "public_url",
+        AnyHttpUrl("https://restling.example.com"),
+    )
     monkeypatch.setattr(settings, "smtp_host", "127.0.0.1")
     monkeypatch.setattr(settings, "smtp_from_email", "no-reply@example.com")
     monkeypatch.setattr(settings, "smtp_security", "none")
@@ -950,7 +966,11 @@ def test_email_change_can_retry_after_smtp_failure(
     assert login.status_code == 200
 
     settings = cast(Settings, app.state.settings)
-
+    monkeypatch.setattr(
+        settings,
+        "public_url",
+        AnyHttpUrl("https://restling.example.com"),
+    )
     monkeypatch.setattr(settings, "smtp_host", "127.0.0.1")
     monkeypatch.setattr(settings, "smtp_from_email", "no-reply@example.com")
     monkeypatch.setattr(settings, "smtp_security", "none")
