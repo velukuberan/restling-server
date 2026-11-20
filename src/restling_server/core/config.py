@@ -34,6 +34,31 @@ class Settings(BaseSettings):
         validation_alias="RESTLING_INVITATION_EXPIRY_HOURS",
     )
 
+    # Verified email-change configuration.
+    email_change_expiry_minutes: int = Field(
+        default=30,
+        ge=1,
+        validation_alias="RESTLING_EMAIL_CHANGE_EXPIRY_MINUTES",
+    )
+
+    email_change_cooldown_seconds: int = Field(
+        default=60,
+        ge=1,
+        validation_alias="RESTLING_EMAIL_CHANGE_COOLDOWN_SECONDS",
+    )
+
+    email_change_hourly_limit: int = Field(
+        default=5,
+        ge=1,
+        validation_alias="RESTLING_EMAIL_CHANGE_HOURLY_LIMIT",
+    )
+
+    email_change_smtp_attempt_hourly_limit: int = Field(
+        default=10,
+        ge=1,
+        validation_alias="RESTLING_EMAIL_CHANGE_SMTP_ATTEMPT_HOURLY_LIMIT",
+    )
+
     password_reset_expiry_minutes: int = Field(
         default=30,
         ge=1,
@@ -57,6 +82,12 @@ class Settings(BaseSettings):
         default=2,
         ge=1,
         validation_alias="RESTLING_MAX_ACTIVE_SESSIONS",
+    )
+
+    session_history_retention_days: int = Field(
+        default=30,
+        ge=1,
+        validation_alias="RESTLING_SESSION_HISTORY_RETENTION_DAYS",
     )
 
     public_url: AnyHttpUrl | None = Field(
