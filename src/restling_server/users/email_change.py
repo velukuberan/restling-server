@@ -10,6 +10,7 @@ from restling_server.users.email_change_email import (
 from restling_server.users.email_change_links import build_email_change_url
 from restling_server.users.service import (
     commit_email_change_token_after_delivery,
+    reserve_email_change_delivery_attempt,
     validate_email_change_request,
 )
 from restling_server.users.tokens import generate_token
@@ -46,6 +47,19 @@ def request_email_change_verification(
         settings,
         token=raw_token,
     )
+
+    attempt_reserved = reserve_email_change_delivery_attempt(
+        session,
+        access_token=access_token,
+        current_password=current_password,
+        email=email,
+        cooldown_seconds=settings.email_change_cooldown_seconds,
+        hourly_limit=settings.email_change_hourly_limit,
+        smtp_attempt_hourly_limit=settings.email_change_smtp_attempt_hourly_limit,
+    )
+
+    if not attempt_reserved:
+        return False
 
     # SMTP happens outside the database transaction.
     send_email_change_verification(

@@ -1,6 +1,8 @@
 """Integration tests for self-service email-change requests."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
 from typing import cast
 from unittest.mock import patch
 
@@ -13,8 +15,19 @@ from uuid6 import uuid7
 
 from restling_server.core.config import Settings
 from restling_server.main import app
-from restling_server.users.models import AuditLog, LoginSession, OneTimeToken, User
+from restling_server.users.email_change_links import build_email_change_url
+from restling_server.users.models import (
+    AuditLog,
+    EmailChangeDeliveryAttempt,
+    LoginSession,
+    OneTimeToken,
+    User,
+)
 from restling_server.users.passwords import hash_password
+from restling_server.users.service import (
+    EmailChangeRateLimitedError,
+    reserve_email_change_delivery_attempt,
+)
 from restling_server.users.tokens import hash_token
 
 
@@ -1024,3 +1037,257 @@ def test_email_change_can_retry_after_smtp_failure(
 
         assert user is not None
         assert user.email == email
+
+
+def test_email_change_limits_failed_smtp_attempts(
+    api_client: TestClient,
+    test_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated SMTP failures cannot bypass the attempt quota."""
+    key = uuid7().hex
+    email = f"email-change-attempt-limit-{key}@example.com"
+    password = "A secure SMTP attempt limit test passphrase"
+
+    with Session(test_engine) as session:
+        user = User(
+            email=email,
+            normalized_email=email,
+            display_name="SMTP Attempt Limit Test User",
+            status="active",
+            system_role="user",
+            password_hash=hash_password(password),
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    login = api_client.post(
+        "/api/v1/auth/login",
+        json={"email": email, "password": password},
+    )
+
+    assert login.status_code == 200
+
+    settings = cast(Settings, app.state.settings)
+
+    monkeypatch.setattr(
+        settings,
+        "public_url",
+        AnyHttpUrl("https://restling.example.com"),
+    )
+    monkeypatch.setattr(settings, "smtp_host", "127.0.0.1")
+    monkeypatch.setattr(settings, "smtp_from_email", "no-reply@example.com")
+    monkeypatch.setattr(settings, "smtp_security", "none")
+    monkeypatch.setattr(
+        settings,
+        "email_change_smtp_attempt_hourly_limit",
+        2,
+    )
+
+    headers = {"Authorization": f"Bearer {login.json()['data']['access_token']}"}
+
+    payload = {
+        "email": f"new-{key}@example.com",
+        "current_password": password,
+    }
+
+    with patch("smtplib.SMTP", side_effect=OSError("SMTP unavailable")) as mock_smtp:
+        first = api_client.post(
+            "/api/v1/users/me/email-change",
+            headers=headers,
+            json=payload,
+        )
+        second = api_client.post(
+            "/api/v1/users/me/email-change",
+            headers=headers,
+            json=payload,
+        )
+        third = api_client.post(
+            "/api/v1/users/me/email-change",
+            headers=headers,
+            json=payload,
+        )
+
+    assert first.status_code == 503
+    assert second.status_code == 503
+
+    assert third.status_code == 429
+    assert third.json()["error"]["code"] == "RATE_LIMIT_EXCEEDED"
+
+    # Only the first two requests should reach SMTP.
+    assert mock_smtp.call_count == 2
+
+    with Session(test_engine) as session:
+        attempt_count = session.scalar(
+            select(func.count(EmailChangeDeliveryAttempt.id)).where(
+                EmailChangeDeliveryAttempt.user_id == user_id,
+            )
+        )
+
+        assert attempt_count == 2
+
+
+def test_concurrent_email_change_smtp_reservations(
+    api_client: TestClient,
+    test_engine: Engine,
+) -> None:
+    """Concurrent reservations cannot exceed the SMTP attempt quota."""
+    key = uuid7().hex
+    email = f"concurrent-email-change-{key}@example.com"
+    password = "A secure concurrent SMTP test passphrase"
+
+    with Session(test_engine) as session:
+        user = User(
+            email=email,
+            normalized_email=email,
+            display_name="Concurrent SMTP Test User",
+            status="active",
+            system_role="user",
+            password_hash=hash_password(password),
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    login = api_client.post(
+        "/api/v1/auth/login",
+        json={"email": email, "password": password},
+    )
+    assert login.status_code == 200
+
+    access_token = login.json()["data"]["access_token"]
+    new_email = f"new-{key}@example.com"
+    barrier = Barrier(2)
+
+    def reserve() -> str:
+        barrier.wait()
+
+        try:
+            with Session(test_engine) as session:
+                reserve_email_change_delivery_attempt(
+                    session,
+                    access_token=access_token,
+                    current_password=password,
+                    email=new_email,
+                    cooldown_seconds=60,
+                    hourly_limit=5,
+                    smtp_attempt_hourly_limit=1,
+                )
+        except EmailChangeRateLimitedError:
+            return "limited"
+
+        return "reserved"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(reserve)
+        second = executor.submit(reserve)
+
+        results = [first.result(), second.result()]
+
+    assert sorted(results) == ["limited", "reserved"]
+
+    with Session(test_engine) as session:
+        attempt_count = session.scalar(
+            select(func.count(EmailChangeDeliveryAttempt.id)).where(
+                EmailChangeDeliveryAttempt.user_id == user_id,
+            )
+        )
+
+    assert attempt_count == 1
+
+
+def test_email_change_skips_delivery_when_target_becomes_current(
+    api_client: TestClient,
+    test_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not send SMTP when the target becomes the current email."""
+    key = uuid7().hex
+    original_email = f"before-{key}@example.com"
+    new_email = f"after-{key}@example.com"
+    password = "A secure email change race test passphrase"
+
+    with Session(test_engine) as session:
+        user = User(
+            email=original_email,
+            normalized_email=original_email,
+            display_name="Email Change Race Test User",
+            status="active",
+            system_role="user",
+            password_hash=hash_password(password),
+        )
+        session.add(user)
+        session.flush()
+        user_id = user.id
+        session.commit()
+
+    login = api_client.post(
+        "/api/v1/auth/login",
+        json={"email": original_email, "password": password},
+    )
+    assert login.status_code == 200
+
+    settings = cast(Settings, app.state.settings)
+
+    monkeypatch.setattr(
+        settings,
+        "public_url",
+        AnyHttpUrl("https://restling.example.com"),
+    )
+    monkeypatch.setattr(settings, "smtp_host", "127.0.0.1")
+    monkeypatch.setattr(settings, "smtp_from_email", "no-reply@example.com")
+    monkeypatch.setattr(settings, "smtp_security", "none")
+
+    def change_email_before_reservation(
+        settings: Settings,
+        *,
+        token: str,
+    ) -> str:
+        verification_url = build_email_change_url(settings, token=token)
+
+        # Simulate another transaction changing the account's email.
+        with Session(test_engine) as session:
+            user = session.get(User, user_id)
+            assert user is not None
+
+            user.email = new_email
+            user.normalized_email = new_email
+            session.commit()
+
+        return verification_url
+
+    with (
+        patch(
+            "restling_server.users.email_change.build_email_change_url",
+            side_effect=change_email_before_reservation,
+        ),
+        patch("smtplib.SMTP") as mock_smtp,
+    ):
+        response = api_client.post(
+            "/api/v1/users/me/email-change",
+            headers={"Authorization": f"Bearer {login.json()['data']['access_token']}"},
+            json={
+                "email": new_email,
+                "current_password": password,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "Email address is unchanged."
+    mock_smtp.assert_not_called()
+
+    with Session(test_engine) as session:
+        stored_user = session.get(User, user_id)
+        assert stored_user is not None
+        assert stored_user.email == new_email
+
+        attempts = session.scalar(
+            select(func.count(EmailChangeDeliveryAttempt.id)).where(
+                EmailChangeDeliveryAttempt.user_id == user_id,
+            )
+        )
+
+        assert attempts == 0

@@ -53,6 +53,12 @@ class Settings(BaseSettings):
         validation_alias="RESTLING_EMAIL_CHANGE_HOURLY_LIMIT",
     )
 
+    email_change_smtp_attempt_hourly_limit: int = Field(
+        default=10,
+        ge=1,
+        validation_alias="RESTLING_EMAIL_CHANGE_SMTP_ATTEMPT_HOURLY_LIMIT",
+    )
+
     password_reset_expiry_minutes: int = Field(
         default=30,
         ge=1,

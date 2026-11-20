@@ -68,3 +68,56 @@ def test_email_change_configuration_rejects_zero(
             postgres_password=SecretStr("test"),
             postgres_db="test",
         )
+
+
+def test_email_change_smtp_attempt_limit_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SMTP attempt quota defaults to ten attempts per hour."""
+    monkeypatch.delenv(
+        "RESTLING_EMAIL_CHANGE_SMTP_ATTEMPT_HOURLY_LIMIT",
+        raising=False,
+    )
+
+    settings = Settings(
+        postgres_user="test",
+        postgres_password=SecretStr("test"),
+        postgres_db="test",
+    )
+
+    assert settings.email_change_smtp_attempt_hourly_limit == 10
+
+
+def test_email_change_smtp_attempt_limit_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Administrators can configure the SMTP attempt quota."""
+    monkeypatch.setenv(
+        "RESTLING_EMAIL_CHANGE_SMTP_ATTEMPT_HOURLY_LIMIT",
+        "20",
+    )
+
+    settings = Settings(
+        postgres_user="test",
+        postgres_password=SecretStr("test"),
+        postgres_db="test",
+    )
+
+    assert settings.email_change_smtp_attempt_hourly_limit == 20
+
+
+def test_email_change_smtp_attempt_limit_rejects_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SMTP attempt quota must be positive."""
+    monkeypatch.setenv(
+        "RESTLING_EMAIL_CHANGE_SMTP_ATTEMPT_HOURLY_LIMIT",
+        "0",
+    )
+
+    with pytest.raises(ValidationError):
+        Settings(
+            postgres_user="test",
+            postgres_password=SecretStr("test"),
+            postgres_db="test",
+        )

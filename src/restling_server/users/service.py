@@ -22,6 +22,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from restling_server.users.models import (
     AccessToken,
     AuditLog,
+    EmailChangeDeliveryAttempt,
     LoginSession,
     OneTimeToken,
     RefreshTokenHistory,
@@ -843,6 +844,120 @@ def validate_email_change_request(
         )
 
         return True
+
+
+def reserve_email_change_delivery_attempt(
+    session: Session,
+    *,
+    access_token: str,
+    current_password: str,
+    email: str,
+    cooldown_seconds: int,
+    hourly_limit: int,
+    smtp_attempt_hourly_limit: int,
+) -> bool:
+    """Atomically reserve an email-change SMTP delivery attempt."""
+    if smtp_attempt_hourly_limit < 1:
+        raise ValueError("SMTP attempt hourly limit must be positive.")
+
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Serialize attempt reservations for the same account.
+        user = session.scalar(select(User).where(User.id == actor_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or user.status != "active"
+            or user.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if user.password_hash is None or not verify_password(
+            current_password,
+            user.password_hash,
+        ):
+            raise InvalidCredentialsError("Invalid current password.")
+
+        email_change_required = _check_email_change_target(
+            session,
+            user=user,
+            email=email,
+        )
+
+        if not email_change_required:
+            return False
+
+        # Preserve existing successful-issuance restrictions.
+        _enforce_email_change_cooldown(
+            session,
+            user_id=user.id,
+            now=now,
+            cooldown_seconds=cooldown_seconds,
+        )
+
+        _enforce_email_change_hourly_limit(
+            session,
+            user_id=user.id,
+            now=now,
+            hourly_limit=hourly_limit,
+        )
+
+        # Count every permitted SMTP attempt, including failures.
+        attempt_count = session.scalar(
+            select(func.count(EmailChangeDeliveryAttempt.id)).where(
+                EmailChangeDeliveryAttempt.user_id == user.id,
+                EmailChangeDeliveryAttempt.created_at > now - timedelta(hours=1),
+            )
+        )
+
+        if attempt_count is not None and attempt_count >= smtp_attempt_hourly_limit:
+            raise EmailChangeRateLimitedError(
+                "Hourly email-change SMTP attempt limit exceeded."
+            )
+
+        session.add(
+            EmailChangeDeliveryAttempt(
+                user_id=user.id,
+                created_at=now,
+            )
+        )
+
+        session.flush()
+
+    return True
 
 
 def commit_email_change_token_after_delivery(
