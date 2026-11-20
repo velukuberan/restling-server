@@ -54,6 +54,14 @@ class UserAlreadyExistsError(Exception):
     """A user account with this email already exists."""
 
 
+class EmailAlreadyExistsError(Exception):
+    """The requested email address belongs to another account."""
+
+
+class EmailChangeRateLimitedError(Exception):
+    """The account has exceeded an email-change request limit."""
+
+
 class UserListingNotAllowedError(Exception):
     """The actor cannot list server accounts."""
 
@@ -650,6 +658,320 @@ def reset_user_password(
             )
         )
         session.flush()
+
+
+def _normalize_email_change_target(  # pyright: ignore[reportUnusedFunction]
+    email: str,
+) -> tuple[str, str]:
+    """Validate and normalize a proposed login email address."""
+    original_email = email.strip()
+
+    try:
+        validated_email = validate_email(
+            original_email,
+            check_deliverability=False,
+        )
+    except EmailNotValidError as exc:
+        raise ValueError("Invalid email address.") from exc
+
+    normalized_email = validated_email.normalized.casefold()
+
+    return original_email, normalized_email
+
+
+def _check_email_change_target(  # pyright: ignore[reportUnusedFunction]
+    session: Session,
+    *,
+    user: User,
+    email: str,
+) -> bool:
+    """Return False for the current email, True for an available new email."""
+    _, normalized_email = _normalize_email_change_target(email)
+
+    # Same login identity: no change required.
+    if user.normalized_email == normalized_email:
+        return False
+
+    existing_user_id = session.scalar(
+        select(User.id).where(
+            User.normalized_email == normalized_email,
+            User.id != user.id,
+        )
+    )
+
+    if existing_user_id is not None:
+        raise EmailAlreadyExistsError("A user with this email address already exists.")
+
+    return True
+
+
+def _enforce_email_change_cooldown(  # pyright: ignore[reportUnusedFunction]
+    session: Session,
+    *,
+    user_id: UUID,
+    now: datetime,
+    cooldown_seconds: int,
+) -> None:
+    """Reject a request made too soon after a successful email-change request."""
+    if cooldown_seconds < 1:
+        raise ValueError("Email-change cooldown must be positive.")
+
+    cooldown_start = now - timedelta(seconds=cooldown_seconds)
+
+    recent_token_id = session.scalar(
+        select(OneTimeToken.id)
+        .where(
+            OneTimeToken.user_id == user_id,
+            OneTimeToken.purpose == "email_change",
+            OneTimeToken.created_at > cooldown_start,
+        )
+        .limit(1)
+    )
+
+    if recent_token_id is not None:
+        raise EmailChangeRateLimitedError(
+            "Please wait before requesting another email change."
+        )
+
+
+def _enforce_email_change_hourly_limit(
+    session: Session,
+    *,
+    user_id: UUID,
+    now: datetime,
+    hourly_limit: int,
+) -> None:
+    """Reject requests exceeding the successful hourly issuance quota."""
+    if hourly_limit < 1:
+        raise ValueError("Email-change hourly limit must be positive.")
+
+    window_start = now - timedelta(hours=1)
+
+    request_count = session.scalar(
+        select(func.count(OneTimeToken.id)).where(
+            OneTimeToken.user_id == user_id,
+            OneTimeToken.purpose == "email_change",
+            OneTimeToken.created_at > window_start,
+        )
+    )
+
+    if request_count is not None and request_count >= hourly_limit:
+        raise EmailChangeRateLimitedError("Hourly email-change request limit exceeded.")
+
+
+def validate_email_change_request(
+    session: Session,
+    *,
+    access_token: str,
+    current_password: str,
+    email: str,
+    cooldown_seconds: int,
+    hourly_limit: int,
+) -> bool:
+    """Validate authorization and email availability for a change request."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        user = session.scalar(select(User).where(User.id == actor_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or user.status != "active"
+            or user.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if user.password_hash is None or not verify_password(
+            current_password,
+            user.password_hash,
+        ):
+            raise InvalidCredentialsError("Invalid current password.")
+
+        email_change_required = _check_email_change_target(
+            session,
+            user=user,
+            email=email,
+        )
+
+        if not email_change_required:
+            return False
+
+        _enforce_email_change_cooldown(
+            session,
+            user_id=user.id,
+            now=now,
+            cooldown_seconds=cooldown_seconds,
+        )
+
+        _enforce_email_change_hourly_limit(
+            session,
+            user_id=user.id,
+            now=now,
+            hourly_limit=hourly_limit,
+        )
+
+        return True
+
+
+def commit_email_change_token_after_delivery(
+    session: Session,
+    *,
+    access_token: str,
+    current_password: str,
+    email: str,
+    raw_token: str,
+    expiry_minutes: int,
+    cooldown_seconds: int,
+    hourly_limit: int,
+) -> bool:
+    """Persist a delivered email-change token, replacing previous tokens."""
+    if expiry_minutes < 1:
+        raise ValueError("Email-change expiry must be positive.")
+
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        user = session.scalar(select(User).where(User.id == actor_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or user.status != "active"
+            or user.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if user.password_hash is None or not verify_password(
+            current_password,
+            user.password_hash,
+        ):
+            raise InvalidCredentialsError("Invalid current password.")
+
+        email_change_required = _check_email_change_target(
+            session,
+            user=user,
+            email=email,
+        )
+
+        if not email_change_required:
+            return False
+
+        _enforce_email_change_cooldown(
+            session,
+            user_id=user.id,
+            now=now,
+            cooldown_seconds=cooldown_seconds,
+        )
+
+        _enforce_email_change_hourly_limit(
+            session,
+            user_id=user.id,
+            now=now,
+            hourly_limit=hourly_limit,
+        )
+
+        original_email, _ = _normalize_email_change_target(email)
+
+        existing_tokens = session.scalars(
+            select(OneTimeToken)
+            .where(
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose == "email_change",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+            .order_by(OneTimeToken.id)
+            .with_for_update()
+        ).all()
+
+        for existing_token in existing_tokens:
+            existing_token.revoked_at = now
+
+        session.add(
+            OneTimeToken(
+                user_id=user.id,
+                purpose="email_change",
+                token_hash=hash_token(raw_token),
+                pending_email=original_email,
+                created_at=now,
+                expires_at=now + timedelta(minutes=expiry_minutes),
+            )
+        )
+
+        session.add(
+            AuditLog(
+                actor_user_id=user.id,
+                target_user_id=user.id,
+                action="user.email_change.requested",
+            )
+        )
+
+        session.flush()
+
+    return True
 
 
 def activate_user(

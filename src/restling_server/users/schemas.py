@@ -96,6 +96,32 @@ class UpdateUserProfileRequest(BaseModel):
         return normalized or None
 
 
+class RequestEmailChangeRequest(BaseModel):
+    """Request a verified change to the current user's email."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=1)
+    current_password: str = Field(min_length=1, repr=False)
+
+
+class VerifyEmailChangeRequest(BaseModel):
+    """Confirm an email change using a one-time verification token."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, repr=False)
+
+
+class AdminChangeUserEmailRequest(BaseModel):
+    """Administrator request to change a user's login email."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=1)
+    current_password: str = Field(min_length=1, repr=False)
+
+
 class CreateUserRequest(BaseModel):
     """Administrator request to create a pending account."""
 

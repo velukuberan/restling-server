@@ -21,6 +21,13 @@ from restling_server.users.activation_links import (
     ActivationURLNotConfiguredError,
 )
 from restling_server.users.dependencies import CurrentUser
+from restling_server.users.email_change import (
+    request_email_change_verification,
+)
+from restling_server.users.email_change_email import EmailChangeDeliveryError
+from restling_server.users.email_change_links import (
+    EmailChangeURLNotConfiguredError,
+)
 from restling_server.users.invitation_email import InvitationDeliveryError
 from restling_server.users.invitations import (
     deliver_activation_invitation,
@@ -38,6 +45,7 @@ from restling_server.users.schemas import (
     RefreshTokenRequest,
     ReissueInvitationRequest,
     ReissueInvitationResponse,
+    RequestEmailChangeRequest,
     ResetPasswordRequest,
     ResetPasswordResponse,
     RestoreUserRequest,
@@ -55,6 +63,8 @@ from restling_server.users.schemas import (
 from restling_server.users.service import (
     AdministratorProfileUpdateNotAllowedError,
     AdministratorSessionAccessNotAllowedError,
+    EmailAlreadyExistsError,
+    EmailChangeRateLimitedError,
     InvalidActivationTokenError,
     InvalidCredentialsError,
     InvalidPasswordResetTokenError,
@@ -258,6 +268,82 @@ def update_my_profile(
 
     return UserDetailResponse(
         data=UserDetail.model_validate(user),
+    )
+
+
+@users_router.post(
+    "/me/email-change",
+    status_code=200,
+)
+def request_email_change(
+    payload: RequestEmailChangeRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    request: Request,
+) -> JSONResponse:
+    """Request verification of a new login email address."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    settings = cast(Settings, request.app.state.settings)
+
+    try:
+        email_change_required = request_email_change_verification(
+            session,
+            settings=settings,
+            access_token=credentials.credentials,
+            current_password=payload.current_password,
+            email=payload.email,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except EmailAlreadyExistsError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "EMAIL_ALREADY_EXISTS",
+                    "message": "A user with this email address already exists.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except (EmailChangeDeliveryError, EmailChangeURLNotConfiguredError):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "EMAIL_DELIVERY_UNAVAILABLE",
+                    "message": "Email verification delivery is unavailable.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except EmailChangeRateLimitedError:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "code": "RATE_LIMIT_EXCEEDED",
+                    "message": "Please wait before requesting another email change.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    if not email_change_required:
+        return JSONResponse(
+            status_code=200,
+            content={"message": "Email address is unchanged."},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "message": "Email-change verification has been sent.",
+        },
+        headers={"Cache-Control": "no-store"},
     )
 
 
