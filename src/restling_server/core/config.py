@@ -90,6 +90,18 @@ class Settings(BaseSettings):
         validation_alias="RESTLING_SESSION_HISTORY_RETENTION_DAYS",
     )
 
+    one_time_token_retention_days: int = Field(
+        default=30,
+        ge=1,
+        validation_alias="RESTLING_ONE_TIME_TOKEN_RETENTION_DAYS",
+    )
+
+    expired_access_token_retention_hours: int = Field(
+        default=1,
+        ge=1,
+        validation_alias="RESTLING_EXPIRED_ACCESS_TOKEN_RETENTION_HOURS",
+    )
+
     public_url: AnyHttpUrl | None = Field(
         default=None,
         validation_alias="RESTLING_PUBLIC_URL",

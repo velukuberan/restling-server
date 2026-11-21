@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from restling_server.core.config import Settings
 from restling_server.users.email_change_email import (
     EmailChangeDeliveryError,
+    send_email_change_notification,
     send_email_change_verification,
 )
 from restling_server.users.email_change_links import build_email_change_url
@@ -12,6 +13,7 @@ from restling_server.users.service import (
     commit_email_change_token_after_delivery,
     reserve_email_change_delivery_attempt,
     validate_email_change_request,
+    verify_email_change,
 )
 from restling_server.users.tokens import generate_token
 
@@ -80,3 +82,28 @@ def request_email_change_verification(
         cooldown_seconds=settings.email_change_cooldown_seconds,
         hourly_limit=settings.email_change_hourly_limit,
     )
+
+
+def confirm_email_change(
+    session: Session,
+    *,
+    settings: Settings,
+    token: str,
+) -> None:
+    """Verify an email change and notify the previous address."""
+    old_email, new_email = verify_email_change(
+        session,
+        token=token,
+    )
+
+    # The database transaction has already committed.
+    # Notification failure must not undo the completed change.
+    try:
+        send_email_change_notification(
+            settings,
+            recipient=old_email,
+            new_email=new_email,
+        )
+    except EmailChangeDeliveryError:
+        # Best-effort security notification.
+        pass

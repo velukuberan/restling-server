@@ -22,6 +22,7 @@ from restling_server.users.activation_links import (
 )
 from restling_server.users.dependencies import CurrentUser
 from restling_server.users.email_change import (
+    confirm_email_change,
     request_email_change_verification,
 )
 from restling_server.users.email_change_email import EmailChangeDeliveryError
@@ -36,6 +37,7 @@ from restling_server.users.invitations import (
 from restling_server.users.schemas import (
     ActivateUserRequest,
     ActivateUserResponse,
+    AdminChangeUserEmailRequest,
     CreateUserRequest,
     CreateUserResponse,
     LoginRequest,
@@ -59,14 +61,18 @@ from restling_server.users.schemas import (
     UserSessionsResponse,
     UsersResponse,
     UserSummary,
+    VerifyEmailChangeRequest,
 )
 from restling_server.users.service import (
+    AdministratorEmailChangeNotAllowedError,
     AdministratorProfileUpdateNotAllowedError,
     AdministratorSessionAccessNotAllowedError,
     EmailAlreadyExistsError,
+    EmailChangeNotAllowedError,
     EmailChangeRateLimitedError,
     InvalidActivationTokenError,
     InvalidCredentialsError,
+    InvalidEmailChangeTokenError,
     InvalidPasswordResetTokenError,
     InvitationNotAllowedError,
     InvitationRevocationAccessDeniedError,
@@ -84,6 +90,8 @@ from restling_server.users.service import (
     UserSuspensionNotAllowedError,
     activate_user,
     authenticate_access_token,
+    cancel_email_change,
+    change_user_email_as_administrator,
     create_user,
     get_user_detail,
     list_administrator_user_sessions,
@@ -205,6 +213,54 @@ def complete_password_reset(
     response.headers["Cache-Control"] = "no-store"
 
     return ResetPasswordResponse(message="Password reset successfully.")
+
+
+@router.post(
+    "/verify-email-change",
+    status_code=200,
+)
+def verify_email_change_endpoint(
+    payload: VerifyEmailChangeRequest,
+    session: DbSession,
+    request: Request,
+) -> JSONResponse:
+    """Confirm a new login email using a one-time credential."""
+    settings = cast(Settings, request.app.state.settings)
+
+    try:
+        confirm_email_change(
+            session,
+            settings=settings,
+            token=payload.token,
+        )
+    except InvalidEmailChangeTokenError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "INVALID_EMAIL_CHANGE_TOKEN",
+                    "message": "Invalid or expired email-change credential.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except EmailAlreadyExistsError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "EMAIL_ALREADY_EXISTS",
+                    "message": "A user with this email address already exists.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={"message": "Email address verified successfully."},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 users_router = APIRouter(
@@ -817,6 +873,97 @@ def update_user_profile_as_administrator_route(
                 "error": {
                     "code": "USER_NOT_FOUND",
                     "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return UserDetailResponse(
+        data=UserDetail.model_validate(user),
+    )
+
+
+@users_router.patch(
+    "/{user_id}/email",
+    response_model=UserDetailResponse,
+    status_code=200,
+)
+def change_user_email_as_administrator_route(
+    user_id: UUID,
+    payload: AdminChangeUserEmailRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    response: Response,
+) -> UserDetailResponse | JSONResponse:
+    """Change a user's login email as an administrator."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        user = change_user_email_as_administrator(
+            session,
+            access_token=credentials.credentials,
+            user_id=user_id,
+            email=payload.email,
+            current_password=payload.current_password,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except AdministratorEmailChangeNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except EmailAlreadyExistsError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "EMAIL_ALREADY_EXISTS",
+                    "message": "A user with this email address already exists.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except EmailChangeNotAllowedError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "EMAIL_CHANGE_NOT_ALLOWED",
+                    "message": (
+                        "Pending accounts must use the invitation-correction workflow."
+                    ),
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "INVALID_EMAIL",
+                    "message": "Invalid email address.",
                 }
             },
             headers={"Cache-Control": "no-store"},
@@ -1562,6 +1709,34 @@ def revoke_all_user_sessions_as_administrator(
             },
             headers={"Cache-Control": "no-store"},
         )
+
+    return Response(
+        status_code=204,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@users_router.delete(
+    "/me/email-change",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def cancel_my_email_change(
+    credentials: LogoutCredentials,
+    session: DbSession,
+) -> Response:
+    """Cancel outstanding email-change verification requests."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        cancel_email_change(
+            session,
+            access_token=credentials.credentials,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
 
     return Response(
         status_code=204,

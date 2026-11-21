@@ -15,6 +15,7 @@ from restling_server.users.models import (
     AccessToken,
     AuditLog,
     LoginSession,
+    OneTimeToken,
     User,
 )
 from restling_server.users.service import (
@@ -69,6 +70,10 @@ def suspension_accounts(
         with test_engine.begin() as connection:
             user_ids = select(User.id).where(
                 User.normalized_email.in_([admin_email, user_email])
+            )
+
+            connection.execute(
+                delete(OneTimeToken).where(OneTimeToken.user_id.in_(user_ids))
             )
 
             # Sessions must be deleted before their owning users.
@@ -544,3 +549,73 @@ def test_suspension_creates_audit_event(
         assert event.action == "user.suspended"
         assert event.event_metadata == {}
         assert event.created_at is not None
+
+
+def test_suspension_revokes_pending_email_change_tokens(
+    test_engine: Engine,
+    suspension_accounts: tuple[UUID, UUID],
+) -> None:
+    """Suspension must revoke outstanding email-change credentials."""
+    administrator_id, user_id = suspension_accounts
+    now = datetime.now(UTC)
+
+    pending_token_hash = hash_token(generate_token())
+
+    with Session(test_engine) as session:
+        with session.begin():
+            session.add(
+                OneTimeToken(
+                    user_id=user_id,
+                    purpose="email_change",
+                    token_hash=pending_token_hash,
+                    pending_email="suspension-new@example.com",
+                    created_at=now,
+                    expires_at=now + timedelta(minutes=30),
+                )
+            )
+
+    # Confirm the token exists and is outstanding.
+    with Session(test_engine) as session:
+        token = session.scalar(
+            select(OneTimeToken).where(
+                OneTimeToken.token_hash == pending_token_hash,
+            )
+        )
+
+        assert token is not None
+        assert token.revoked_at is None
+        assert token.consumed_at is None
+
+    # Suspend the account using the real lifecycle service.
+    with Session(test_engine) as session:
+        suspend_user(
+            session,
+            actor_id=administrator_id,
+            user_id=user_id,
+        )
+
+    # Verify the committed state using a fresh session.
+    with Session(test_engine) as session:
+        user = session.get(User, user_id)
+
+        assert user is not None
+        assert user.status == "suspended"
+
+        token = session.scalar(
+            select(OneTimeToken).where(
+                OneTimeToken.token_hash == pending_token_hash,
+            )
+        )
+
+        assert token is not None
+        assert token.revoked_at is not None
+        assert token.consumed_at is None
+
+        events = session.scalars(
+            select(AuditLog).where(
+                AuditLog.target_user_id == user_id,
+                AuditLog.action == "user.suspended",
+            )
+        ).all()
+
+        assert len(events) == 1

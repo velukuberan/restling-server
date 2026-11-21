@@ -10,6 +10,7 @@ from psycopg.errors import UniqueViolation
 from sqlalchemy import (
     and_,
     case,
+    delete,
     func,
     or_,
     select,
@@ -107,6 +108,10 @@ class InvalidPasswordResetTokenError(Exception):
     """The password-reset credential is invalid or no longer usable."""
 
 
+class InvalidEmailChangeTokenError(Exception):
+    """The email-change credential is invalid or no longer usable."""
+
+
 class UserSuspensionNotAllowedError(Exception):
     """The actor or target account is not eligible for suspension."""
 
@@ -125,6 +130,14 @@ class ProfileUpdateNotAllowedError(Exception):
 
 class AdministratorProfileUpdateNotAllowedError(Exception):
     """The actor cannot update another user's profile."""
+
+
+class AdministratorEmailChangeNotAllowedError(Exception):
+    """The actor cannot change a user's login email."""
+
+
+class EmailChangeNotAllowedError(Exception):
+    """The target account is not eligible for an email change."""
 
 
 class LastAdministratorError(Exception):
@@ -1087,6 +1100,143 @@ def commit_email_change_token_after_delivery(
         session.flush()
 
     return True
+
+
+def verify_email_change(
+    session: Session,
+    *,
+    token: str,
+) -> tuple[str, str]:
+    """Confirm an email change and revoke all existing sessions."""
+    token_digest = hash_token(token)
+
+    try:
+        with session.begin():
+            token_user_id = session.scalar(
+                select(OneTimeToken.user_id).where(
+                    OneTimeToken.token_hash == token_digest,
+                    OneTimeToken.purpose == "email_change",
+                )
+            )
+
+            if token_user_id is None:
+                raise InvalidEmailChangeTokenError(
+                    "Invalid or expired email-change credential."
+                )
+
+            # Follow the existing user-first locking convention.
+            user = session.scalar(
+                select(User).where(User.id == token_user_id).with_for_update()
+            )
+
+            if user is None or user.status != "active" or user.password_reset_required:
+                raise InvalidEmailChangeTokenError(
+                    "Invalid or expired email-change credential."
+                )
+
+            stored_token = session.scalar(
+                select(OneTimeToken)
+                .where(
+                    OneTimeToken.user_id == user.id,
+                    OneTimeToken.token_hash == token_digest,
+                    OneTimeToken.purpose == "email_change",
+                )
+                .with_for_update()
+            )
+
+            now = datetime.now(UTC)
+
+            if (
+                stored_token is None
+                or stored_token.expires_at <= now
+                or stored_token.consumed_at is not None
+                or stored_token.revoked_at is not None
+                or stored_token.pending_email is None
+            ):
+                raise InvalidEmailChangeTokenError(
+                    "Invalid or expired email-change credential."
+                )
+
+            new_email, normalized_email = _normalize_email_change_target(
+                stored_token.pending_email
+            )
+
+            if user.normalized_email == normalized_email:
+                raise InvalidEmailChangeTokenError(
+                    "Email address has already been changed."
+                )
+
+            existing_user_id = session.scalar(
+                select(User.id).where(
+                    User.normalized_email == normalized_email,
+                    User.id != user.id,
+                )
+            )
+
+            if existing_user_id is not None:
+                raise EmailAlreadyExistsError(
+                    "A user with this email address already exists."
+                )
+
+            login_sessions = session.scalars(
+                select(LoginSession)
+                .where(
+                    LoginSession.user_id == user.id,
+                    LoginSession.revoked_at.is_(None),
+                )
+                .order_by(LoginSession.id)
+                .with_for_update()
+            ).all()
+
+            for login_session in login_sessions:
+                login_session.refresh_token_hash = None
+                login_session.revoked_at = now
+                login_session.revocation_reason = "email_change"
+
+            old_email = user.email
+            user.email = new_email
+            user.normalized_email = normalized_email
+
+            stored_token.consumed_at = now
+
+            # Invalidate other outstanding email-change credentials.
+            other_tokens = session.scalars(
+                select(OneTimeToken)
+                .where(
+                    OneTimeToken.user_id == user.id,
+                    OneTimeToken.purpose == "email_change",
+                    OneTimeToken.id != stored_token.id,
+                    OneTimeToken.consumed_at.is_(None),
+                    OneTimeToken.revoked_at.is_(None),
+                )
+                .order_by(OneTimeToken.id)
+                .with_for_update()
+            ).all()
+
+            for other_token in other_tokens:
+                other_token.revoked_at = now
+
+            session.add(
+                AuditLog(
+                    actor_user_id=user.id,
+                    target_user_id=user.id,
+                    action="user.email_change.verified",
+                )
+            )
+
+            session.flush()
+    except IntegrityError as exc:
+        if (
+            isinstance(exc.orig, UniqueViolation)
+            and exc.orig.diag.constraint_name == "users_normalized_email_key"
+        ):
+            raise EmailAlreadyExistsError(
+                "A user with this email address already exists."
+            ) from exc
+
+        raise
+
+    return old_email, new_email
 
 
 def activate_user(
@@ -2219,6 +2369,22 @@ def suspend_user(
             login_session.revoked_at = now
             login_session.revocation_reason = "account_suspended"
 
+        # Revoke outstanding email-change tokens on suspension.
+        pending_email_tokens = session.scalars(
+            select(OneTimeToken)
+            .where(
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose == "email_change",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+            .order_by(OneTimeToken.id)
+            .with_for_update()
+        ).all()
+
+        for token in pending_email_tokens:
+            token.revoked_at = now
+
         user.status = "suspended"
 
         session.add(
@@ -2591,3 +2757,384 @@ def update_user_profile_as_administrator(
             session.flush()
 
     return target
+
+
+def cancel_email_change(
+    session: Session,
+    *,
+    access_token: str,
+) -> None:
+    """Revoke pending email-change tokens for the authenticated user."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        user_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if user_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Serialize account operations using the existing user-row lock.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if user is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        # Revalidate authentication after acquiring the lock.
+        current_session_id = session.scalar(
+            select(LoginSession.id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+        )
+
+        if (
+            current_session_id is None
+            or user.status != "active"
+            or user.password_reset_required
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        pending_tokens = session.scalars(
+            select(OneTimeToken)
+            .where(
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose == "email_change",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+                OneTimeToken.expires_at > now,
+            )
+            .order_by(OneTimeToken.id)
+            .with_for_update()
+        ).all()
+
+        # Repeated cancellation is a no-op.
+        if not pending_tokens:
+            return
+
+        for pending_token in pending_tokens:
+            pending_token.revoked_at = now
+
+        session.add(
+            AuditLog(
+                actor_user_id=user.id,
+                target_user_id=user.id,
+                action="user.email_change.cancelled",
+            )
+        )
+
+        session.flush()
+
+
+def change_user_email_as_administrator(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+    email: str,
+    current_password: str,
+) -> User:
+    """Immediately change a user's email with administrator authorization."""
+    token_digest = hash_token(access_token)
+
+    try:
+        with session.begin():
+            actor_id = session.scalar(
+                select(LoginSession.user_id)
+                .join(AccessToken, AccessToken.session_id == LoginSession.id)
+                .where(AccessToken.token_hash == token_digest)
+            )
+
+            if actor_id is None:
+                raise InvalidCredentialsError("Invalid access credential.")
+
+            # Lock both accounts in a consistent order.
+            locked_users = session.scalars(
+                select(User)
+                .where(User.id.in_([actor_id, user_id]))
+                .order_by(User.id)
+                .with_for_update()
+            ).all()
+
+            users_by_id = {user.id: user for user in locked_users}
+            actor = users_by_id.get(actor_id)
+            target = users_by_id.get(user_id)
+
+            if actor is None:
+                raise InvalidCredentialsError("Invalid access credential.")
+
+            now = datetime.now(UTC)
+
+            # Revalidate authentication after locking the accounts.
+            current_session_id = session.scalar(
+                select(LoginSession.id)
+                .join(AccessToken, AccessToken.session_id == LoginSession.id)
+                .where(
+                    LoginSession.user_id == actor.id,
+                    AccessToken.token_hash == token_digest,
+                    AccessToken.expires_at > now,
+                    LoginSession.expires_at > now,
+                    LoginSession.revoked_at.is_(None),
+                )
+            )
+
+            if (
+                current_session_id is None
+                or actor.status != "active"
+                or actor.password_reset_required
+            ):
+                raise InvalidCredentialsError("Invalid access credential.")
+
+            if actor.system_role != "administrator":
+                raise AdministratorEmailChangeNotAllowedError(
+                    "Administrator privileges are required."
+                )
+
+            if not verify_password(current_password, actor.password_hash or ""):
+                raise InvalidCredentialsError("Invalid current password.")
+
+            if target is None:
+                raise UserNotFoundError("User account not found.")
+
+            if target.status == "pending":
+                raise EmailChangeNotAllowedError(
+                    "Pending accounts must use the invitation-correction workflow."
+                )
+
+            original_email, normalized_email = _normalize_email_change_target(email)
+
+            # An unchanged login identity requires no mutation.
+            if target.normalized_email == normalized_email:
+                return target
+
+            existing_user_id = session.scalar(
+                select(User.id).where(
+                    User.normalized_email == normalized_email,
+                    User.id != target.id,
+                )
+            )
+
+            if existing_user_id is not None:
+                raise EmailAlreadyExistsError(
+                    "A user with this email address already exists."
+                )
+
+            pending_tokens = session.scalars(
+                select(OneTimeToken)
+                .where(
+                    OneTimeToken.user_id == target.id,
+                    OneTimeToken.purpose == "email_change",
+                    OneTimeToken.consumed_at.is_(None),
+                    OneTimeToken.revoked_at.is_(None),
+                )
+                .order_by(OneTimeToken.id)
+                .with_for_update()
+            ).all()
+
+            for pending_token in pending_tokens:
+                pending_token.revoked_at = now
+
+            target_sessions = session.scalars(
+                select(LoginSession)
+                .where(
+                    LoginSession.user_id == target.id,
+                    LoginSession.revoked_at.is_(None),
+                )
+                .order_by(LoginSession.id)
+                .with_for_update()
+            ).all()
+
+            for target_session in target_sessions:
+                target_session.refresh_token_hash = None
+                target_session.revoked_at = now
+                target_session.revocation_reason = "email_changed"
+
+            target.email = original_email
+            target.normalized_email = normalized_email
+
+            session.add(
+                AuditLog(
+                    actor_user_id=actor.id,
+                    target_user_id=target.id,
+                    action="user.email_change.admin",
+                )
+            )
+
+            session.flush()
+    except IntegrityError as exc:
+        if (
+            isinstance(exc.orig, UniqueViolation)
+            and exc.orig.diag.constraint_name == "users_normalized_email_key"
+        ):
+            raise EmailAlreadyExistsError(
+                "A user with this email address already exists."
+            ) from exc
+
+        raise
+
+    return target
+
+    return target
+
+
+def cleanup_one_time_tokens(
+    session: Session,
+    *,
+    now: datetime,
+    retention_days: int,
+    batch_size: int,
+) -> int:
+    """Delete one bounded batch of tokens beyond their retention period."""
+    if retention_days < 1:
+        raise ValueError("Token retention must be positive.")
+
+    if batch_size < 1:
+        raise ValueError("Cleanup batch size must be positive.")
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Cleanup time must be timezone-aware.")
+
+    cutoff = now - timedelta(days=retention_days)
+
+    with session.begin():
+        token_ids = session.scalars(
+            select(OneTimeToken.id)
+            .where(
+                or_(
+                    and_(
+                        OneTimeToken.consumed_at.is_not(None),
+                        OneTimeToken.consumed_at <= cutoff,
+                    ),
+                    and_(
+                        OneTimeToken.revoked_at.is_not(None),
+                        OneTimeToken.revoked_at <= cutoff,
+                    ),
+                    and_(
+                        OneTimeToken.consumed_at.is_(None),
+                        OneTimeToken.revoked_at.is_(None),
+                        OneTimeToken.expires_at <= cutoff,
+                    ),
+                )
+            )
+            .order_by(OneTimeToken.id)
+            .limit(batch_size)
+            .with_for_update(skip_locked=True)
+        ).all()
+
+        if not token_ids:
+            return 0
+
+        session.execute(
+            delete(OneTimeToken).where(
+                OneTimeToken.id.in_(token_ids),
+            )
+        )
+
+        return len(token_ids)
+
+
+def cleanup_expired_access_tokens(
+    session: Session,
+    *,
+    now: datetime,
+    retention_hours: int,
+    batch_size: int,
+) -> int:
+    """Delete one bounded batch of access tokens beyond retention."""
+    if retention_hours < 1:
+        raise ValueError("Access-token retention must be positive.")
+
+    if batch_size < 1:
+        raise ValueError("Cleanup batch size must be positive.")
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Cleanup time must be timezone-aware.")
+
+    cutoff = now - timedelta(hours=retention_hours)
+
+    with session.begin():
+        token_ids = session.scalars(
+            select(AccessToken.id)
+            .where(AccessToken.expires_at <= cutoff)
+            .order_by(AccessToken.id)
+            .limit(batch_size)
+            .with_for_update(skip_locked=True)
+        ).all()
+
+        if not token_ids:
+            return 0
+
+        session.execute(
+            delete(AccessToken).where(
+                AccessToken.id.in_(token_ids),
+            )
+        )
+
+        return len(token_ids)
+
+
+def cleanup_inactive_sessions(
+    session: Session,
+    *,
+    now: datetime,
+    retention_days: int,
+    batch_size: int,
+) -> int:
+    """Delete one bounded batch of sessions beyond history retention."""
+    if retention_days < 1:
+        raise ValueError("Session-history retention must be positive.")
+
+    if batch_size < 1:
+        raise ValueError("Cleanup batch size must be positive.")
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Cleanup time must be timezone-aware.")
+
+    cutoff = now - timedelta(days=retention_days)
+
+    with session.begin():
+        session_ids = session.scalars(
+            select(LoginSession.id)
+            .where(
+                or_(
+                    and_(
+                        LoginSession.revoked_at.is_not(None),
+                        LoginSession.revoked_at <= cutoff,
+                    ),
+                    and_(
+                        LoginSession.revoked_at.is_(None),
+                        LoginSession.expires_at <= cutoff,
+                    ),
+                )
+            )
+            .order_by(LoginSession.id)
+            .limit(batch_size)
+            .with_for_update(skip_locked=True)
+        ).all()
+
+        if not session_ids:
+            return 0
+
+        session.execute(
+            delete(LoginSession).where(
+                LoginSession.id.in_(session_ids),
+            )
+        )
+
+        return len(session_ids)

@@ -80,3 +80,55 @@ def _send_message(
         )
 
     smtp.send_message(message)
+
+
+def send_email_change_notification(
+    settings: Settings,
+    *,
+    recipient: str,
+    new_email: str,
+) -> None:
+    """Notify the previous address after a verified email change."""
+    if settings.smtp_host is None or settings.smtp_from_email is None:
+        raise EmailChangeDeliveryError("SMTP delivery is not configured.")
+
+    message = EmailMessage()
+    message["Subject"] = "Your Restling account email was changed"
+    message["From"] = str(settings.smtp_from_email)
+    message["To"] = recipient
+
+    message.set_content(
+        "The email address associated with your Restling account "
+        "has been changed.\n\n"
+        f"New email address: {new_email}\n\n"
+        "If you made this change, no action is required.\n\n"
+        "If you did not authorize this change, contact your "
+        "Restling administrator immediately."
+    )
+
+    ssl_context = ssl.create_default_context()
+
+    try:
+        if settings.smtp_security == "ssl":
+            with smtplib.SMTP_SSL(
+                settings.smtp_host,
+                settings.smtp_port,
+                timeout=10,
+                context=ssl_context,
+            ) as smtp:
+                _send_message(smtp, settings, message)
+        else:
+            with smtplib.SMTP(
+                settings.smtp_host,
+                settings.smtp_port,
+                timeout=10,
+            ) as smtp:
+                if settings.smtp_security == "starttls":
+                    smtp.starttls(context=ssl_context)
+
+                _send_message(smtp, settings, message)
+
+    except (OSError, smtplib.SMTPException):
+        raise EmailChangeDeliveryError(
+            "Unable to deliver email-change notification."
+        ) from None
