@@ -13,6 +13,7 @@ from restling_server.users.models import AccessToken, AuditLog, LoginSession, Us
 from restling_server.users.passwords import hash_password
 from restling_server.users.service import (
     InvalidCredentialsError,
+    OneTimeToken,
     UserRestorationNotAllowedError,
     authenticate_access_token,
     login_user,
@@ -64,6 +65,10 @@ def restoration_accounts(
         with test_engine.begin() as connection:
             user_ids = select(User.id).where(
                 User.normalized_email.in_([admin_email, user_email])
+            )
+
+            connection.execute(
+                delete(OneTimeToken).where(OneTimeToken.user_id.in_(user_ids))
             )
 
             connection.execute(
@@ -509,3 +514,68 @@ def test_restoration_creates_audit_event(
         assert audit_events[0].event_metadata == {
             "password_reset_required": False,
         }
+
+
+def test_restoration_does_not_reactivate_email_change_token(
+    test_engine: Engine,
+    restoration_accounts: tuple[UUID, UUID],
+) -> None:
+    """Restoring an account must not revive revoked email-change tokens."""
+    administrator_id, user_id = restoration_accounts
+    now = datetime.now(UTC)
+    token_hash = hash_token(generate_token())
+
+    with Session(test_engine) as session:
+        with session.begin():
+            session.add(
+                OneTimeToken(
+                    user_id=user_id,
+                    purpose="email_change",
+                    token_hash=token_hash,
+                    pending_email="restored-new@example.com",
+                    created_at=now,
+                    expires_at=now + timedelta(hours=1),
+                )
+            )
+
+    with Session(test_engine) as session:
+        suspend_user(
+            session,
+            actor_id=administrator_id,
+            user_id=user_id,
+        )
+
+    with Session(test_engine) as session:
+        token = session.scalar(
+            select(OneTimeToken).where(
+                OneTimeToken.token_hash == token_hash,
+            )
+        )
+
+        assert token is not None
+        assert token.revoked_at is not None
+        assert token.consumed_at is None
+        revoked_at = token.revoked_at
+
+    with Session(test_engine) as session:
+        restore_user(
+            session,
+            actor_id=administrator_id,
+            user_id=user_id,
+        )
+
+    with Session(test_engine) as session:
+        user = session.get(User, user_id)
+
+        assert user is not None
+        assert user.status == "active"
+
+        token = session.scalar(
+            select(OneTimeToken).where(
+                OneTimeToken.token_hash == token_hash,
+            )
+        )
+
+        assert token is not None
+        assert token.revoked_at == revoked_at
+        assert token.consumed_at is None

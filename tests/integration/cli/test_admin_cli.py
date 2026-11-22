@@ -2,11 +2,14 @@
 
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import URL, Engine, create_engine, delete, select
+from sqlalchemy import URL, Engine, create_engine, delete, event, select, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from uuid6 import uuid7
@@ -15,7 +18,13 @@ import restling_server.users.invitations as invitations
 from restling_server.core.config import Settings
 from restling_server.users import cli
 from restling_server.users.invitation_email import InvitationDeliveryError
-from restling_server.users.models import OneTimeToken, User
+from restling_server.users.models import (
+    AccessToken,
+    LoginSession,
+    OneTimeToken,
+    RefreshTokenHistory,
+    User,
+)
 from restling_server.users.service import bootstrap_administrator
 from restling_server.users.tokens import hash_token
 
@@ -32,6 +41,20 @@ def test_admin_cli_displays_help() -> None:
 
     assert result.returncode == 0
     assert "bootstrap" in result.stdout
+
+
+def test_admin_cli_displays_cleanup_auth_help() -> None:
+    """Administrator CLI exposes the auth cleanup command."""
+    result = subprocess.run(
+        ["uv", "run", "restling-admin", "cleanup-auth", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0
+    assert "cleanup-auth" in result.stdout
 
 
 def test_admin_cli_rejects_password_mismatch(
@@ -1195,3 +1218,404 @@ def test_admin_cli_handles_smtp_delivery_failure(
             connection.execute(
                 delete(User).where(User.normalized_email.in_([admin_email, user_email]))
             )
+
+
+def test_cleanup_auth_cli_deletes_eligible_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    test_engine: Engine,
+) -> None:
+    """CLI deletes old tokens using the configured retention period."""
+    now = datetime.now(UTC)
+    email = f"cli-cleanup-{uuid7().hex}@example.com"
+
+    old_token_hash = hash_token(uuid7().hex)
+    recent_token_hash = hash_token(uuid7().hex)
+
+    with Session(test_engine) as session:
+        with session.begin():
+            user = User(
+                email=email,
+                normalized_email=email,
+                display_name="Cleanup CLI User",
+                status="active",
+                system_role="user",
+                password_hash="test-password-hash",
+            )
+
+            session.add(user)
+            session.flush()
+
+            session.add_all(
+                [
+                    OneTimeToken(
+                        user_id=user.id,
+                        purpose="password_reset",
+                        token_hash=old_token_hash,
+                        created_at=now - timedelta(days=46),
+                        expires_at=now - timedelta(days=45),
+                    ),
+                    OneTimeToken(
+                        user_id=user.id,
+                        purpose="password_reset",
+                        token_hash=recent_token_hash,
+                        created_at=now - timedelta(days=21),
+                        expires_at=now - timedelta(days=20),
+                    ),
+                ]
+            )
+
+    settings = Settings.model_validate(
+        {
+            "postgres_user": "test_user",
+            "postgres_password": "test_password",
+            "postgres_db": "test_db",
+            "RESTLING_ONE_TIME_TOKEN_RETENTION_DAYS": 30,
+        }
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["restling-admin", "cleanup-auth"],
+    )
+
+    monkeypatch.setattr(cli, "Settings", lambda: settings)
+
+    def use_test_engine(_settings: object) -> Engine:
+        return test_engine
+
+    monkeypatch.setattr(
+        cli,
+        "create_database_engine",
+        use_test_engine,
+    )
+
+    cli.main()
+
+    with Session(test_engine) as session:
+        old_token = session.scalar(
+            select(OneTimeToken).where(
+                OneTimeToken.token_hash == old_token_hash,
+            )
+        )
+
+        recent_token = session.scalar(
+            select(OneTimeToken).where(
+                OneTimeToken.token_hash == recent_token_hash,
+            )
+        )
+
+        assert old_token is None
+        assert recent_token is not None
+
+
+def test_cleanup_auth_cli_rejects_overlapping_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    test_engine: Engine,
+) -> None:
+    """A second cleanup invocation must not run while one holds the lock."""
+    settings = Settings.model_validate(
+        {
+            "postgres_user": "test_user",
+            "postgres_password": "test_password",
+            "postgres_db": "test_db",
+        }
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["restling-admin", "cleanup-auth"],
+    )
+    monkeypatch.setattr(cli, "Settings", lambda: settings)
+
+    def use_test_engine(_settings: object) -> Engine:
+        return test_engine
+
+    monkeypatch.setattr(
+        cli,
+        "create_database_engine",
+        use_test_engine,
+    )
+
+    # Simulate another cleanup process holding the maintenance lock.
+    # This is a session-level PostgreSQL advisory lock.
+    with test_engine.connect() as lock_connection:
+        acquired = lock_connection.scalar(
+            text("SELECT pg_try_advisory_lock(723941, 3)")
+        )
+        assert acquired is True
+
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main()
+
+            assert exc_info.value.code != 0
+
+            captured = capsys.readouterr()
+            assert "already running" in captured.err.lower()
+
+        finally:
+            released = lock_connection.scalar(
+                text("SELECT pg_advisory_unlock(723941, 3)")
+            )
+            assert released is True
+
+
+def test_cleanup_auth_cli_releases_lock_after_database_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    test_engine: Engine,
+) -> None:
+    """A database failure must not leave the cleanup lock held."""
+    settings = Settings.model_validate(
+        {
+            "postgres_user": "test_user",
+            "postgres_password": "test_password",
+            "postgres_db": "test_db",
+        }
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["restling-admin", "cleanup-auth"],
+    )
+    monkeypatch.setattr(cli, "Settings", lambda: settings)
+
+    def use_test_engine(_settings: object) -> Engine:
+        return test_engine
+
+    monkeypatch.setattr(
+        cli,
+        "create_database_engine",
+        use_test_engine,
+    )
+
+    def simulate_database_failure(
+        connection: Connection,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        if "FROM one_time_tokens" in statement:
+            raise SQLAlchemyError("Simulated database failure")
+
+    event.listen(
+        test_engine,
+        "before_cursor_execute",
+        simulate_database_failure,
+    )
+
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main()
+
+        assert exc_info.value.code != 0
+
+        captured = capsys.readouterr()
+        assert "Database operation failed" in captured.err
+        assert "Traceback" not in captured.err
+
+    finally:
+        event.remove(
+            test_engine,
+            "before_cursor_execute",
+            simulate_database_failure,
+        )
+
+    # A new connection must be able to acquire the maintenance lock.
+    with test_engine.connect() as connection:
+        acquired = connection.scalar(text("SELECT pg_try_advisory_lock(723941, 3)"))
+
+        assert acquired is True
+
+        released = connection.scalar(text("SELECT pg_advisory_unlock(723941, 3)"))
+        assert released is True
+
+
+def test_cleanup_auth_cli_deletes_expired_access_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    test_engine: Engine,
+) -> None:
+    """CLI removes old access tokens without deleting their login session."""
+    now = datetime.now(UTC)
+    email = f"cli-access-cleanup-{uuid7().hex}@example.com"
+
+    old_token_hash = hash_token(uuid7().hex)
+    recent_token_hash = hash_token(uuid7().hex)
+
+    with Session(test_engine) as session:
+        with session.begin():
+            user = User(
+                email=email,
+                normalized_email=email,
+                display_name="CLI Access Cleanup User",
+                status="active",
+                system_role="user",
+                password_hash="test-password-hash",
+            )
+            session.add(user)
+            session.flush()
+
+            login_session = LoginSession(
+                user_id=user.id,
+                refresh_token_hash=hash_token(uuid7().hex),
+                created_at=now - timedelta(days=2),
+                expires_at=now + timedelta(days=5),
+            )
+            session.add(login_session)
+            session.flush()
+
+            login_session_id = login_session.id
+
+            session.add_all(
+                [
+                    AccessToken(
+                        session_id=login_session_id,
+                        token_hash=old_token_hash,
+                        created_at=now - timedelta(hours=3),
+                        expires_at=now - timedelta(hours=2),
+                    ),
+                    AccessToken(
+                        session_id=login_session_id,
+                        token_hash=recent_token_hash,
+                        created_at=now - timedelta(hours=1),
+                        expires_at=now - timedelta(minutes=30),
+                    ),
+                ]
+            )
+
+    settings = Settings.model_validate(
+        {
+            "postgres_user": "test_user",
+            "postgres_password": "test_password",
+            "postgres_db": "test_db",
+            "RESTLING_EXPIRED_ACCESS_TOKEN_RETENTION_HOURS": 1,
+        }
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["restling-admin", "cleanup-auth"],
+    )
+    monkeypatch.setattr(cli, "Settings", lambda: settings)
+
+    def use_test_engine(_settings: object) -> Engine:
+        return test_engine
+
+    monkeypatch.setattr(
+        cli,
+        "create_database_engine",
+        use_test_engine,
+    )
+
+    cli.main()
+
+    with Session(test_engine) as session:
+        old_token = session.scalar(
+            select(AccessToken).where(
+                AccessToken.token_hash == old_token_hash,
+            )
+        )
+        recent_token = session.scalar(
+            select(AccessToken).where(
+                AccessToken.token_hash == recent_token_hash,
+            )
+        )
+        retained_session = session.get(
+            LoginSession,
+            login_session_id,
+        )
+
+        assert old_token is None
+        assert recent_token is not None
+        assert retained_session is not None
+
+
+def test_cleanup_auth_cli_deletes_inactive_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+    test_engine: Engine,
+) -> None:
+    """CLI removes old sessions and their history, preserving active sessions."""
+    now = datetime.now(UTC)
+    email = f"cli-session-cleanup-{uuid7().hex}@example.com"
+
+    with Session(test_engine) as session:
+        with session.begin():
+            user = User(
+                email=email,
+                normalized_email=email,
+                display_name="CLI Session Cleanup User",
+                status="active",
+                system_role="user",
+                password_hash="test-password-hash",
+            )
+            session.add(user)
+            session.flush()
+
+            old_session = LoginSession(
+                user_id=user.id,
+                refresh_token_hash=hash_token(uuid7().hex),
+                created_at=now - timedelta(days=50),
+                expires_at=now - timedelta(days=45),
+            )
+
+            active_session = LoginSession(
+                user_id=user.id,
+                refresh_token_hash=hash_token(uuid7().hex),
+                created_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=6),
+            )
+
+            session.add_all([old_session, active_session])
+            session.flush()
+
+            old_session_id = old_session.id
+            active_session_id = active_session.id
+
+            history = RefreshTokenHistory(
+                session_id=old_session_id,
+                token_hash=hash_token(uuid7().hex),
+                used_at=now - timedelta(days=48),
+            )
+            session.add(history)
+            session.flush()
+
+            history_id = history.id
+
+    settings = Settings.model_validate(
+        {
+            "postgres_user": "test_user",
+            "postgres_password": "test_password",
+            "postgres_db": "test_db",
+            "RESTLING_SESSION_HISTORY_RETENTION_DAYS": 30,
+        }
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["restling-admin", "cleanup-auth"],
+    )
+    monkeypatch.setattr(cli, "Settings", lambda: settings)
+
+    def use_test_engine(_settings: object) -> Engine:
+        return test_engine
+
+    monkeypatch.setattr(
+        cli,
+        "create_database_engine",
+        use_test_engine,
+    )
+
+    cli.main()
+
+    with Session(test_engine) as session:
+        assert session.get(LoginSession, old_session_id) is None
+        assert session.get(RefreshTokenHistory, history_id) is None
+        assert session.get(LoginSession, active_session_id) is not None

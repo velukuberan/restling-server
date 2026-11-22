@@ -1,12 +1,13 @@
 """Command-line administration for Restling Server."""
 
 import argparse
+from datetime import UTC, datetime
 from getpass import getpass
 from uuid import UUID
 
 from email_validator import EmailNotValidError, validate_email
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -29,6 +30,9 @@ from restling_server.users.service import (
     AdministratorAlreadyInitializedError,
     InvitationNotAllowedError,
     bootstrap_administrator,
+    cleanup_expired_access_tokens,
+    cleanup_inactive_sessions,
+    cleanup_one_time_tokens,
 )
 
 
@@ -119,6 +123,11 @@ def main() -> None:
     subparsers.add_parser(
         "bootstrap",
         help="Create the initial server administrator.",
+    )
+
+    subparsers.add_parser(
+        "cleanup-auth",
+        help="Remove expired and retained authentication tokens.",
     )
 
     invite_parser = subparsers.add_parser(
@@ -248,6 +257,98 @@ def main() -> None:
 
         except InvitationDeliveryError:
             parser.error("Invitation delivery failed. Reissue may be required.")
+
+        except SQLAlchemyError:
+            parser.error("Database operation failed. Check server configuration.")
+
+        finally:
+            if engine is not None:
+                engine.dispose()
+
+    if args.command == "cleanup-auth":
+        try:
+            settings = Settings()  # pyright: ignore[reportCallIssue]
+        except ValidationError:
+            parser.error("Invalid or incomplete server configuration.")
+
+        engine = None
+
+        try:
+            engine = create_database_engine(settings)
+            session_factory = create_session_factory(engine)
+
+            # Hold a session-level advisory lock for the entire cleanup run.
+            # Namespace 723941, key 3 is reserved for authentication cleanup.
+            with engine.connect() as lock_connection:
+                acquired = lock_connection.scalar(
+                    text("SELECT pg_try_advisory_lock(723941, 3)")
+                )
+
+                if not acquired:
+                    parser.error("Authentication cleanup is already running.")
+
+                try:
+                    batch_size = 1000
+                    now = datetime.now(UTC)
+
+                    # Clean up one-time authentication credentials.
+                    one_time_deleted = 0
+
+                    while True:
+                        with session_factory() as session:
+                            deleted_count = cleanup_one_time_tokens(
+                                session,
+                                now=now,
+                                retention_days=settings.one_time_token_retention_days,
+                                batch_size=batch_size,
+                            )
+
+                        one_time_deleted += deleted_count
+
+                        if deleted_count < batch_size:
+                            break
+
+                    # Clean up expired access credentials.
+                    access_deleted = 0
+
+                    while True:
+                        with session_factory() as session:
+                            deleted_count = cleanup_expired_access_tokens(
+                                session,
+                                now=now,
+                                retention_hours=settings.expired_access_token_retention_hours,
+                                batch_size=batch_size,
+                            )
+
+                        access_deleted += deleted_count
+
+                        if deleted_count < batch_size:
+                            break
+
+                    # Clean up inactive login sessions and their token history.
+                    sessions_deleted = 0
+
+                    while True:
+                        with session_factory() as session:
+                            deleted_count = cleanup_inactive_sessions(
+                                session,
+                                now=now,
+                                retention_days=settings.session_history_retention_days,
+                                batch_size=batch_size,
+                            )
+
+                        sessions_deleted += deleted_count
+
+                        if deleted_count < batch_size:
+                            break
+
+                    total_tokens_deleted = one_time_deleted + access_deleted
+
+                    print(f"Authentication tokens deleted: {total_tokens_deleted}")
+                    print(f"Inactive sessions deleted: {sessions_deleted}")
+
+                finally:
+                    lock_connection.scalar(text("SELECT pg_advisory_unlock(723941, 3)"))
 
         except SQLAlchemyError:
             parser.error("Database operation failed. Check server configuration.")

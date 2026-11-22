@@ -246,3 +246,79 @@ def test_authentication_settings_reject_nonpositive_values(
             "http://localhost:8000",
             **{setting: invalid_value},
         )
+
+
+@pytest.mark.parametrize(
+    ("configured_value", "expected_value"),
+    [
+        (None, 30),
+        (7, 7),
+        (90, 90),
+    ],
+)
+def test_one_time_token_retention_configuration(
+    configured_value: int | None,
+    expected_value: int,
+) -> None:
+    """One-time-token retention defaults to 30 days and is configurable."""
+    overrides: dict[str, object] = {}
+
+    if configured_value is not None:
+        overrides["RESTLING_ONE_TIME_TOKEN_RETENTION_DAYS"] = configured_value
+
+    settings = make_settings(
+        "http://localhost:8000",
+        **overrides,
+    )
+
+    assert settings.one_time_token_retention_days == expected_value
+
+
+@pytest.mark.parametrize("invalid_value", [0, -1])
+def test_one_time_token_retention_rejects_nonpositive_values(
+    invalid_value: int,
+) -> None:
+    """One-time-token retention must be at least one day."""
+    with pytest.raises(ValidationError):
+        make_settings(
+            "http://localhost:8000",
+            RESTLING_ONE_TIME_TOKEN_RETENTION_DAYS=invalid_value,
+        )
+
+
+@pytest.mark.parametrize(
+    ("configured_value", "expected_value"),
+    [
+        (None, 1),
+        (2, 2),
+        (24, 24),
+    ],
+)
+def test_expired_access_token_retention_configuration(
+    configured_value: int | None,
+    expected_value: int,
+) -> None:
+    """Expired access tokens are retained for one hour by default."""
+    overrides: dict[str, object] = {}
+
+    if configured_value is not None:
+        overrides["RESTLING_EXPIRED_ACCESS_TOKEN_RETENTION_HOURS"] = configured_value
+
+    settings = make_settings(
+        "http://localhost:8000",
+        **overrides,
+    )
+
+    assert settings.expired_access_token_retention_hours == expected_value
+
+
+@pytest.mark.parametrize("invalid_value", [0, -1])
+def test_expired_access_token_retention_rejects_nonpositive_values(
+    invalid_value: int,
+) -> None:
+    """Expired access-token retention must be at least one hour."""
+    with pytest.raises(ValidationError):
+        make_settings(
+            "http://localhost:8000",
+            RESTLING_EXPIRED_ACCESS_TOKEN_RETENTION_HOURS=invalid_value,
+        )
