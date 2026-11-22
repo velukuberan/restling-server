@@ -6,7 +6,7 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import AnyHttpUrl
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session
 from uuid6 import uuid7
 
@@ -15,6 +15,7 @@ from restling_server.main import app
 from restling_server.users.invitation_email import InvitationDeliveryError
 from restling_server.users.models import (
     AccessToken,
+    AuditLog,
     LoginSession,
     OneTimeToken,
     User,
@@ -657,6 +658,30 @@ def test_administrator_corrects_pending_account_email(
         assert new_token.revoked_at is None
         assert new_token.consumed_at is None
 
+        audit_events = session.scalars(
+            select(AuditLog).where(
+                AuditLog.target_user_id == user_id,
+                AuditLog.action == "user.pending_email_corrected",
+            )
+        ).all()
+
+        assert len(audit_events) == 1
+
+        event = audit_events[0]
+
+        administrator_response = api_client.get(
+            "/api/v1/users/me",
+            headers=auth(administrator_token),
+        )
+
+        assert administrator_response.status_code == 200
+
+        administrator_id = UUID(administrator_response.json()["data"]["id"])
+
+        assert event.actor_user_id == administrator_id
+        assert event.target_user_id == user_id
+        assert event.created_at is not None
+
 
 def test_regular_user_cannot_correct_pending_account_email(
     api_client: TestClient,
@@ -715,6 +740,15 @@ def test_regular_user_cannot_correct_pending_account_email(
         assert original_token.token_hash == hash_token(first_token)
         assert original_token.revoked_at is None
         assert original_token.consumed_at is None
+
+        audit_events = session.scalars(
+            select(AuditLog).where(
+                AuditLog.target_user_id == user_id,
+                AuditLog.action == "user.pending_email_corrected",
+            )
+        ).all()
+
+        assert audit_events == []
 
 
 @pytest.mark.parametrize(
@@ -1903,3 +1937,123 @@ def test_pending_email_correction_rejects_concurrent_correction(
         assert all(
             token.token_hash != hash_token(delivered_tokens[0]) for token in tokens
         )
+
+
+def test_pending_email_correction_rolls_back_on_database_failure(
+    api_client: TestClient,
+    test_engine: Engine,
+    accounts: dict[str, str],
+) -> None:
+    """A failed database flush must roll back the entire correction."""
+    from restling_server.users.service import correct_pending_user_email
+
+    administrator_token = accounts["administrator"]
+
+    user_id, first_token = create_pending_user(
+        api_client,
+        administrator_token,
+    )
+
+    with Session(test_engine) as session:
+        user = session.get(User, user_id)
+
+        assert user is not None
+        original_email = user.email
+        original_normalized_email = user.normalized_email
+
+    corrected_email = f"corrected-{uuid7().hex}@example.com"
+    flush_attempted = False
+
+    with Session(test_engine) as session:
+
+        def fail_flush(
+            session: Session,
+            flush_context: object,
+            instances: object,
+        ) -> None:
+            nonlocal flush_attempted
+            flush_attempted = True
+
+            # Ensure the correction has staged its changes.
+            assert any(
+                isinstance(obj, User)
+                and obj.id == user_id
+                and obj.email == corrected_email
+                for obj in session.dirty
+            )
+
+            assert any(
+                isinstance(obj, OneTimeToken)
+                and obj.token_hash == hash_token(first_token)
+                and obj.revoked_at is not None
+                for obj in session.dirty
+            )
+
+            assert any(
+                isinstance(obj, OneTimeToken)
+                and obj.user_id == user_id
+                and obj.purpose == "account_activation"
+                for obj in session.new
+            )
+
+            assert any(
+                isinstance(obj, AuditLog)
+                and obj.target_user_id == user_id
+                and obj.action == "user.pending_email_corrected"
+                for obj in session.new
+            )
+
+            raise RuntimeError("Simulated database flush failure.")
+
+        event.listen(session, "before_flush", fail_flush)
+
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="Simulated database flush failure",
+            ):
+                correct_pending_user_email(
+                    session,
+                    access_token=administrator_token,
+                    user_id=user_id,
+                    email=corrected_email,
+                    expiry_hours=24,
+                )
+        finally:
+            event.remove(session, "before_flush", fail_flush)
+
+    assert flush_attempted
+
+    # A fresh session must see only the original committed state.
+    with Session(test_engine) as session:
+        user = session.get(User, user_id)
+
+        assert user is not None
+        assert user.email == original_email
+        assert user.normalized_email == original_normalized_email
+        assert user.status == "pending"
+        assert user.password_hash is None
+
+        tokens = session.scalars(
+            select(OneTimeToken).where(
+                OneTimeToken.user_id == user_id,
+                OneTimeToken.purpose == "account_activation",
+            )
+        ).all()
+
+        assert len(tokens) == 1
+
+        original_token = tokens[0]
+
+        assert original_token.token_hash == hash_token(first_token)
+        assert original_token.revoked_at is None
+        assert original_token.consumed_at is None
+
+        correction_audits = session.scalars(
+            select(AuditLog).where(
+                AuditLog.target_user_id == user_id,
+                AuditLog.action == "user.pending_email_corrected",
+            )
+        ).all()
+
+        assert correction_audits == []
