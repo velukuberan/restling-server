@@ -1903,4 +1903,3 @@ def test_pending_email_correction_rejects_concurrent_correction(
         assert all(
             token.token_hash != hash_token(delivered_tokens[0]) for token in tokens
         )
-
