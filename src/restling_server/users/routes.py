@@ -19,6 +19,7 @@ from restling_server.core.config import Settings
 from restling_server.core.dependencies import get_db_session
 from restling_server.users.activation_links import (
     ActivationURLNotConfiguredError,
+    build_activation_url,
 )
 from restling_server.users.dependencies import CurrentUser
 from restling_server.users.email_change import (
@@ -32,12 +33,14 @@ from restling_server.users.email_change_links import (
 from restling_server.users.invitation_email import InvitationDeliveryError
 from restling_server.users.invitations import (
     deliver_activation_invitation,
+    deliver_corrected_activation_invitation,
     prepare_activation_invitation,
 )
 from restling_server.users.schemas import (
     ActivateUserRequest,
     ActivateUserResponse,
     AdminChangeUserEmailRequest,
+    CorrectPendingEmailRequest,
     CreateUserRequest,
     CreateUserResponse,
     LoginRequest,
@@ -70,6 +73,7 @@ from restling_server.users.service import (
     EmailAlreadyExistsError,
     EmailChangeNotAllowedError,
     EmailChangeRateLimitedError,
+    EmailUnchangedError,
     InvalidActivationTokenError,
     InvalidCredentialsError,
     InvalidEmailChangeTokenError,
@@ -92,6 +96,7 @@ from restling_server.users.service import (
     authenticate_access_token,
     cancel_email_change,
     change_user_email_as_administrator,
+    correct_pending_user_email,
     create_user,
     get_user_detail,
     list_administrator_user_sessions,
@@ -1294,6 +1299,191 @@ def reissue_user_invitation(
                 "error": {
                     "code": "INVITATION_DELIVERY_FAILED",
                     "message": "Invitation could not be delivered. Reissue may be required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return ReissueInvitationResponse(invitation=invitation)
+
+
+@users_router.post(
+    "/{user_id}/invitations/correct-email",
+    response_model=ReissueInvitationResponse,
+    status_code=200,
+)
+def correct_pending_email(
+    user_id: UUID,
+    payload: CorrectPendingEmailRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    request: Request,
+    response: Response,
+) -> ReissueInvitationResponse | JSONResponse:
+    """Correct a pending account's email and replace its invitation."""
+
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        with session.begin():
+            actor = authenticate_access_token(
+                session,
+                access_token=credentials.credentials,
+            )
+
+            is_administrator = (
+                actor.system_role == "administrator"
+                and actor.status == "active"
+                and not actor.password_reset_required
+            )
+
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    if not is_administrator:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    settings = cast(Settings, request.app.state.settings)
+
+    delivery = payload.invitation_delivery
+
+    if delivery is None:
+        delivery = "email" if settings.smtp_host is not None else "manual"
+
+    if settings.public_url is None or (
+        delivery == "email"
+        and (settings.smtp_host is None or settings.smtp_from_email is None)
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "INVITATION_UNAVAILABLE",
+                    "message": ("Requested invitation delivery is not available."),
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        if delivery == "manual":
+            raw_token, expires_at = correct_pending_user_email(
+                session,
+                access_token=credentials.credentials,
+                user_id=user_id,
+                email=payload.email,
+                expiry_hours=settings.invitation_expiry_hours,
+            )
+
+            invitation = UserInvitationDetail(
+                delivery="manual",
+                expires_at=expires_at,
+                activation_url=build_activation_url(
+                    settings,
+                    token=raw_token,
+                ),
+            )
+        else:
+            expires_at = deliver_corrected_activation_invitation(
+                session,
+                settings=settings,
+                access_token=credentials.credentials,
+                user_id=user_id,
+                email=payload.email,
+            )
+
+            invitation = UserInvitationDetail(
+                delivery="email",
+                expires_at=expires_at,
+            )
+
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except AdministratorEmailChangeNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except InvitationNotAllowedError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "INVITATION_NOT_ALLOWED",
+                    "message": ("Account is not eligible for email correction."),
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except EmailAlreadyExistsError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "EMAIL_ALREADY_EXISTS",
+                    "message": ("A user with this email address already exists."),
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except EmailUnchangedError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "EMAIL_UNCHANGED",
+                    "message": "The requested email address is unchanged.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except (ActivationURLNotConfiguredError, InvitationDeliveryError):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "INVITATION_DELIVERY_FAILED",
+                    "message": "Invitation could not be delivered.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "INVALID_EMAIL",
+                    "message": str(exc),
                 }
             },
             headers={"Cache-Control": "no-store"},

@@ -157,6 +157,15 @@ class ReissueInvitationRequest(BaseModel):
     invitation_delivery: Literal["email", "manual"] | None = None
 
 
+class CorrectPendingEmailRequest(BaseModel):
+    """Administrator request to correct a pending account's email."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=1)
+    invitation_delivery: Literal["email", "manual"] | None = None
+
+
 class ReissueInvitationResponse(BaseModel):
     """Result of reissuing an activation invitation."""
 

@@ -60,6 +60,10 @@ class EmailAlreadyExistsError(Exception):
     """The requested email address belongs to another account."""
 
 
+class EmailUnchangedError(Exception):
+    """The requested email matches the account's current identity."""
+
+
 class EmailChangeRateLimitedError(Exception):
     """The account has exceeded an email-change request limit."""
 
@@ -404,6 +408,237 @@ def issue_activation_token(
 
         session.add(token)
         session.flush()
+
+    return raw_token, expires_at
+
+
+def _validate_pending_email_correction(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+    email: str,
+) -> tuple[User, User, str, str]:
+    """Validate and lock accounts for pending email correction."""
+    token_digest = hash_token(access_token)
+
+    actor_id = session.scalar(
+        select(LoginSession.user_id)
+        .join(
+            AccessToken,
+            AccessToken.session_id == LoginSession.id,
+        )
+        .where(AccessToken.token_hash == token_digest)
+    )
+
+    if actor_id is None:
+        raise InvalidCredentialsError("Invalid access credential.")
+
+    locked_users = session.scalars(
+        select(User)
+        .where(User.id.in_([actor_id, user_id]))
+        .order_by(User.id)
+        .with_for_update()
+    ).all()
+
+    users_by_id = {user.id: user for user in locked_users}
+    actor = users_by_id.get(actor_id)
+    target = users_by_id.get(user_id)
+
+    if actor is None:
+        raise InvalidCredentialsError("Invalid access credential.")
+
+    now = datetime.now(UTC)
+
+    current_session_id = session.scalar(
+        select(LoginSession.id)
+        .join(
+            AccessToken,
+            AccessToken.session_id == LoginSession.id,
+        )
+        .where(
+            LoginSession.user_id == actor.id,
+            AccessToken.token_hash == token_digest,
+            AccessToken.expires_at > now,
+            LoginSession.expires_at > now,
+            LoginSession.revoked_at.is_(None),
+        )
+    )
+
+    if (
+        current_session_id is None
+        or actor.status != "active"
+        or actor.password_reset_required
+    ):
+        raise InvalidCredentialsError("Invalid access credential.")
+
+    if actor.system_role != "administrator":
+        raise AdministratorEmailChangeNotAllowedError(
+            "Administrator privileges are required."
+        )
+
+    if target is None:
+        raise UserNotFoundError("User account not found.")
+
+    if target.status != "pending":
+        raise InvitationNotAllowedError("Account is not eligible for email correction.")
+
+    original_email, normalized_email = _normalize_email_change_target(email)
+
+    if target.normalized_email == normalized_email:
+        raise EmailUnchangedError("The requested email address is unchanged.")
+
+    existing_user_id = session.scalar(
+        select(User.id).where(
+            User.normalized_email == normalized_email,
+            User.id != target.id,
+        )
+    )
+
+    if existing_user_id is not None:
+        raise EmailAlreadyExistsError("A user with this email address already exists.")
+
+    return actor, target, original_email, normalized_email
+
+
+@dataclass(frozen=True)
+class PendingEmailCorrectionState:
+    """Account state captured before invitation delivery."""
+
+    normalized_email: str
+    invitation_ids: tuple[UUID, ...]
+
+
+def prepare_pending_email_correction(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+    email: str,
+) -> tuple[str, PendingEmailCorrectionState]:
+    """Validate a correction without modifying the account."""
+    with session.begin():
+        _, target, recipient, _ = _validate_pending_email_correction(
+            session,
+            access_token=access_token,
+            user_id=user_id,
+            email=email,
+        )
+
+        invitation_ids = session.scalars(
+            select(OneTimeToken.id)
+            .where(
+                OneTimeToken.user_id == target.id,
+                OneTimeToken.purpose == "account_activation",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+            .order_by(OneTimeToken.id)
+        ).all()
+
+        state = PendingEmailCorrectionState(
+            normalized_email=target.normalized_email,
+            invitation_ids=tuple(invitation_ids),
+        )
+
+    return recipient, state
+
+
+def correct_pending_user_email(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+    email: str,
+    expiry_hours: int,
+    raw_token: str | None = None,
+    expected_state: PendingEmailCorrectionState | None = None,
+) -> tuple[str, datetime]:
+    """Correct a pending account's email and replace its invitation."""
+    if expiry_hours < 1:
+        raise ValueError("Invitation expiry must be at least one hour.")
+
+    if (raw_token is None) != (expected_state is None):
+        raise ValueError("Incomplete delivered invitation state.")
+
+    if raw_token is None:
+        raw_token = generate_token()
+
+    try:
+        with session.begin():
+            actor, target, original_email, normalized_email = (
+                _validate_pending_email_correction(
+                    session,
+                    access_token=access_token,
+                    user_id=user_id,
+                    email=email,
+                )
+            )
+
+            now = datetime.now(UTC)
+
+            existing_tokens = session.scalars(
+                select(OneTimeToken)
+                .where(
+                    OneTimeToken.user_id == target.id,
+                    OneTimeToken.purpose == "account_activation",
+                    OneTimeToken.consumed_at.is_(None),
+                    OneTimeToken.revoked_at.is_(None),
+                )
+                .order_by(OneTimeToken.id)
+                .with_for_update()
+            ).all()
+
+            if expected_state is not None:
+                current_state = PendingEmailCorrectionState(
+                    normalized_email=target.normalized_email,
+                    invitation_ids=tuple(token.id for token in existing_tokens),
+                )
+
+                if current_state != expected_state:
+                    raise InvitationNotAllowedError(
+                        "Pending account changed during invitation delivery."
+                    )
+
+            for existing_token in existing_tokens:
+                existing_token.revoked_at = now
+
+            target.email = original_email
+            target.normalized_email = normalized_email
+
+            expires_at = now + timedelta(hours=expiry_hours)
+
+            session.add(
+                OneTimeToken(
+                    user_id=target.id,
+                    purpose="account_activation",
+                    token_hash=hash_token(raw_token),
+                    pending_email=None,
+                    created_at=now,
+                    expires_at=expires_at,
+                )
+            )
+
+            session.add(
+                AuditLog(
+                    actor_user_id=actor.id,
+                    target_user_id=target.id,
+                    action="user.pending_email_corrected",
+                )
+            )
+
+            session.flush()
+
+    except IntegrityError as exc:
+        if (
+            isinstance(exc.orig, UniqueViolation)
+            and exc.orig.diag.constraint_name == "users_normalized_email_key"
+        ):
+            raise EmailAlreadyExistsError(
+                "A user with this email address already exists."
+            ) from exc
+
+        raise
 
     return raw_token, expires_at
 
@@ -2987,8 +3222,6 @@ def change_user_email_as_administrator(
             ) from exc
 
         raise
-
-    return target
 
     return target
 
