@@ -82,26 +82,79 @@ If pytest is forcibly terminated, temporary databases may remain and require man
 CI environments must provide a compatible PostgreSQL instance, database privileges, and configuration before running integration tests.
 
 
+
 ### Production Authentication Rate Limiting
 
 Production deployments must enforce rate limiting and request-abuse protection for authentication and credential-recovery endpoints at a trusted reverse proxy or API gateway.
 
 This includes:
 
+- `POST /api/v1/auth/login`
 - `POST /api/v1/auth/activate`
+- `POST /api/v1/auth/refresh`
 - `POST /api/v1/auth/reset-password`
-- Other authentication and session-management endpoints as they are introduced.
+- Other authentication and session-management endpoints
+  as they are introduced.
 
 Rate limiting must be applied before requests reach the FastAPI application. Configure appropriate request thresholds, burst limits, and responses for excessive requests based on the deployment environment.
 
-**Security considerations:**
+Application-level password-recovery rate limiting supplements this protection. Recovery attempts are persisted in PostgreSQL and coordinated across concurrent requests and application workers.
 
-- Do not rely on application-local, in-memory counters for multi-worker deployments.
-- Use a trusted client IP address; do not blindly trust client-supplied forwarding headers.
-- Avoid logging authentication credentials, activation tokens, or password-reset tokens.
-- Rate limiting supplements token expiration, single-use enforcement, and credential validation; it does not replace them.
+Application-level rate limiting does not replace reverse-proxy or API-gateway protection.
 
-Restling Server does not currently implement application-level rate limiting. Deployments exposing authentication endpoints publicly must configure and verify this protection before accepting production traffic.
+### Trusted Client IP Addresses
+
+Restling Server uses the client address resolved by the ASGI server for IP-based abuse prevention.
+
+The application does not directly trust client-supplied `X-Forwarded-For`, `X-Real-IP`, or `Forwarded` headers.
+
+Client IP addresses are validated and normalized before being used for rate limiting. Missing or invalid client addresses must not be replaced with arbitrary fallback addresses.
+
+#### Direct deployment
+
+When running without a reverse proxy, disable proxy-header processing explicitly:
+
+```bash
+uv run uvicorn restling_server.main:app \
+    --no-proxy-headers
+```
+
+This ensures the application uses the actual connection address rather than client-supplied forwarding headers.
+
+#### Reverse-proxy deployment
+
+When running behind a trusted local reverse proxy, enable proxy-header processing and explicitly configure the trusted proxy address:
+
+```bash
+uv run uvicorn restling_server.main:app \
+    --proxy-headers \
+    --forwarded-allow-ips="127.0.0.1"
+```
+
+For containerized or remote reverse proxies, configure the actual trusted proxy addresses or narrowly scoped networks appropriate to the deployment.
+
+Do not use wildcard proxy trust (`*`).
+
+The reverse proxy or API gateway must sanitize incoming forwarding headers and construct a trustworthy forwarding chain.
+
+Restrict direct access to the application server so that untrusted clients cannot bypass the reverse proxy or its request-abuse protections.
+
+#### Security considerations
+
+- Trust only explicitly configured reverse proxies.
+- Do not blindly trust client-supplied forwarding headers.
+- Do not expose application listeners through paths
+  that bypass production gateway protections.
+- Verify trusted-proxy configuration before accepting
+  production traffic.
+- Do not rely on application-local, in-memory rate-limit
+  counters for multi-worker deployments.
+- Avoid logging authentication credentials, activation
+  tokens, or password-reset tokens.
+- Rate limiting supplements token expiration, single-use
+  enforcement, and credential validation; it does not
+  replace them.
+
 
 ## Administrator CLI
 
