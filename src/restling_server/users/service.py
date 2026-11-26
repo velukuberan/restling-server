@@ -1232,6 +1232,40 @@ def reserve_password_reset_attempt(
     return True
 
 
+def record_password_recovery_failure(
+    session: Session,
+    *,
+    user_id: UUID,
+    reason: Literal[
+        "delivery_failed",
+        "account_state_changed",
+    ],
+) -> None:
+    """Persist a failed password-recovery security event."""
+    if reason == "delivery_failed":
+        action = "user.password_reset_delivery_failed"
+        metadata = {"delivery": "email"}
+
+    elif reason == "account_state_changed":
+        action = "user.password_reset_discarded"
+        metadata = {"reason": "account_state_changed"}
+
+    else:
+        raise ValueError("Unsupported password-recovery failure reason.")
+
+    with session.begin():
+        session.add(
+            AuditLog(
+                actor_user_id=None,
+                target_user_id=user_id,
+                action=action,
+                event_metadata=metadata,
+            )
+        )
+
+        session.flush()
+
+
 def prepare_password_recovery(
     session: Session,
     *,

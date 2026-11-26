@@ -15,6 +15,7 @@ from restling_server.users.password_reset_links import (
 from restling_server.users.service import (
     commit_password_reset_token_after_delivery,
     prepare_password_recovery,
+    record_password_recovery_failure,
     reserve_password_reset_attempt,
 )
 from restling_server.users.tokens import generate_token
@@ -77,10 +78,20 @@ def request_password_recovery(
             recipient=recovery_state.recipient,
             reset_url=reset_url,
         )
-
     except PasswordResetDeliveryError:
         # Never log the recipient, reset URL or raw credential.
         logger.warning("Password-recovery email delivery failed.")
+
+        try:
+            record_password_recovery_failure(
+                session,
+                user_id=recovery_state.user_id,
+                reason="delivery_failed",
+            )
+
+        except Exception:
+            logger.error("Failed to persist password-recovery delivery audit.")
+
         return
 
     credential_persisted = commit_password_reset_token_after_delivery(
@@ -95,6 +106,16 @@ def request_password_recovery(
             "Delivered password-reset credential discarded "
             "because account state changed."
         )
+
+        try:
+            record_password_recovery_failure(
+                session,
+                user_id=recovery_state.user_id,
+                reason="account_state_changed",
+            )
+
+        except Exception:
+            logger.error("Failed to persist password-recovery discard audit.")
 
 
 def process_password_recovery_task(

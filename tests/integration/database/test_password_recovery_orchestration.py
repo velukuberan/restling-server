@@ -337,12 +337,7 @@ def test_recovery_ineligible_account_does_not_send_email(
 
         assert db_session.scalars(select(OneTimeToken)).all() == []
 
-        assert (
-            db_session.scalars(
-                select(AuditLog).where(AuditLog.action == "user.password_reset_issued")
-            ).all()
-            == []
-        )
+        assert db_session.scalars(select(AuditLog)).all() == []
 
 
 def test_recovery_rate_limited_request_does_not_send_email(
@@ -359,6 +354,11 @@ def test_recovery_rate_limited_request_does_not_send_email(
     assert len(smtp.messages) == 1
 
     with db_session.begin():
+        audit_events = db_session.scalars(select(AuditLog)).all()
+
+        assert len(audit_events) == 1
+        assert audit_events[0].action == "user.password_reset_issued"
+        assert audit_events[0].actor_user_id is None
         assert len(db_session.scalars(select(PasswordResetAttempt)).all()) == 1
 
         assert len(db_session.scalars(select(OneTimeToken)).all()) == 1
@@ -447,6 +447,19 @@ def test_recovery_delivery_failure_preserves_previous_token(
             == []
         )
 
+        failure_events = db_session.scalars(
+            select(AuditLog).where(
+                AuditLog.target_user_id == user_id,
+                AuditLog.action == "user.password_reset_delivery_failed",
+            )
+        ).all()
+
+        assert len(failure_events) == 1
+        assert failure_events[0].actor_user_id is None
+        assert failure_events[0].event_metadata == {
+            "delivery": "email",
+        }
+
     with pytest.raises(InvalidPasswordResetTokenError):
         reset_user_password(
             db_session,
@@ -491,6 +504,14 @@ def test_recovery_failed_delivery_consumes_rate_limit(
     assert len(smtp.messages) == 1
 
     with db_session.begin():
+        audit_events = db_session.scalars(select(AuditLog)).all()
+
+        assert len(audit_events) == 1
+        assert audit_events[0].action == "user.password_reset_delivery_failed"
+        assert audit_events[0].actor_user_id is None
+        assert audit_events[0].event_metadata == {
+            "delivery": "email",
+        }
         assert len(db_session.scalars(select(PasswordResetAttempt)).all()) == 1
 
         assert db_session.scalars(select(OneTimeToken)).all() == []
@@ -540,6 +561,19 @@ def test_recovery_rejects_token_when_email_changes_during_delivery(
             ).all()
             == []
         )
+
+        discard_events = db_session.scalars(
+            select(AuditLog).where(
+                AuditLog.target_user_id == user_id,
+                AuditLog.action == "user.password_reset_discarded",
+            )
+        ).all()
+
+        assert len(discard_events) == 1
+        assert discard_events[0].actor_user_id is None
+        assert discard_events[0].event_metadata == {
+            "reason": "account_state_changed",
+        }
 
     with pytest.raises(InvalidPasswordResetTokenError):
         reset_user_password(
@@ -603,6 +637,19 @@ def test_recovery_preserves_administrator_token_issued_during_delivery(
 
         assert len(audit_events) == 1
         assert audit_events[0].actor_user_id == administrator_id
+
+        discard_events = db_session.scalars(
+            select(AuditLog).where(
+                AuditLog.target_user_id == user_id,
+                AuditLog.action == "user.password_reset_discarded",
+            )
+        ).all()
+
+        assert len(discard_events) == 1
+        assert discard_events[0].actor_user_id is None
+        assert discard_events[0].event_metadata == {
+            "reason": "account_state_changed",
+        }
 
     with pytest.raises(InvalidPasswordResetTokenError):
         reset_user_password(
@@ -1902,3 +1949,114 @@ def test_concurrent_recovery_rejects_token_after_completed_password_reset(
             refresh_session_expiry_days=7,
             max_active_sessions=2,
         )
+
+
+@pytest.mark.parametrize(
+    "failure_reason",
+    ["delivery_failed", "account_state_changed"],
+)
+def test_recovery_audit_failure_preserves_existing_credentials(
+    db_session: Session,
+    smtp: SMTPRecorder,
+    caplog: pytest.LogCaptureFixture,
+    failure_reason: str,
+) -> None:
+    """Audit persistence failure must not damage reset credentials."""
+    user_id = create_account(db_session)
+
+    previous_token = generate_token()
+
+    previous_token_id = seed_reset_token(
+        db_session,
+        user_id=user_id,
+        raw_token=previous_token,
+    )
+
+    def fail_audit_persistence(
+        _session: Session,
+        _flush_context: object,
+    ) -> None:
+        raise RuntimeError("Simulated recovery audit persistence failure")
+
+    def prepare_failure() -> None:
+        if failure_reason == "account_state_changed":
+            with db_session.begin():
+                user = db_session.get(User, user_id)
+
+                assert user is not None
+
+                user.display_name = "Updated Recovery Test User"
+
+        # Install the failure only after earlier recovery
+        # transactions and any account mutation have completed.
+        event.listen(
+            db_session,
+            "after_flush_postexec",
+            fail_audit_persistence,
+        )
+
+    smtp.on_send = prepare_failure
+    smtp.fail_delivery = failure_reason == "delivery_failed"
+
+    try:
+        with caplog.at_level("INFO"):
+            request_recovery(db_session)
+
+    finally:
+        event.remove(
+            db_session,
+            "after_flush_postexec",
+            fail_audit_persistence,
+        )
+
+    assert not db_session.in_transaction()
+    assert len(smtp.messages) == 1
+
+    delivered_token = extract_reset_token(smtp.messages[0])
+
+    with db_session.begin():
+        tokens = db_session.scalars(
+            select(OneTimeToken).where(
+                OneTimeToken.user_id == user_id,
+            )
+        ).all()
+
+        assert len(tokens) == 1
+        assert tokens[0].id == previous_token_id
+        assert tokens[0].token_hash == hash_token(previous_token)
+        assert tokens[0].revoked_at is None
+        assert tokens[0].consumed_at is None
+
+        assert db_session.scalars(select(AuditLog)).all() == []
+
+        attempts = db_session.scalars(select(PasswordResetAttempt)).all()
+
+        assert len(attempts) == 1
+
+    if failure_reason == "delivery_failed":
+        assert "Failed to persist password-recovery delivery audit." in caplog.text
+
+    else:
+        assert "Failed to persist password-recovery discard audit." in caplog.text
+
+    assert previous_token not in caplog.text
+    assert delivered_token not in caplog.text
+    assert EMAIL not in caplog.text
+    assert "https://restling.example.com" not in caplog.text
+    assert "Simulated recovery audit persistence failure" not in caplog.text
+
+    # The unsuccessfully delivered or discarded credential
+    # must not be usable.
+    with pytest.raises(InvalidPasswordResetTokenError):
+        reset_user_password(
+            db_session,
+            token=delivered_token,
+            new_password="Another secure recovery passphrase #9274",
+        )
+
+    # The previously issued credential must remain usable.
+    reset_user_password(
+        db_session,
+        token=previous_token,
+        new_password="Another secure recovery passphrase #9274",
+    )
