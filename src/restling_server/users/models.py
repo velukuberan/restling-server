@@ -240,6 +240,59 @@ class EmailChangeDeliveryAttempt(Base):
     )
 
 
+class PasswordResetAttempt(Base):
+    """Record a reserved public password-recovery attempt."""
+
+    __tablename__ = "password_reset_attempts"
+
+    __table_args__ = (
+        CheckConstraint(
+            "LENGTH(email_key) = 64",
+            name="ck_password_reset_attempts_email_key_length",
+        ),
+        CheckConstraint(
+            "LENGTH(TRIM(source_ip)) > 0",
+            name="ck_password_reset_attempts_source_ip_not_empty",
+        ),
+        Index(
+            "ix_password_reset_attempts_email_created_at",
+            "email_key",
+            "created_at",
+        ),
+        Index(
+            "ix_password_reset_attempts_ip_created_at",
+            "source_ip",
+            "created_at",
+        ),
+        Index(
+            "ix_password_reset_attempts_created_at",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True, native_uuid=True),
+        primary_key=True,
+        default=uuid7,
+    )
+
+    email_key: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    source_ip: Mapped[str] = mapped_column(
+        String(45),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
+
+
 class LoginSession(Base):
     """A login session with one current refresh credential."""
 

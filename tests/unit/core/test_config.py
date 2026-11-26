@@ -1,5 +1,7 @@
 """Unit tests for server configuration validation."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -322,3 +324,64 @@ def test_expired_access_token_retention_rejects_nonpositive_values(
             "http://localhost:8000",
             RESTLING_EXPIRED_ACCESS_TOKEN_RETENTION_HOURS=invalid_value,
         )
+
+
+def test_password_reset_rate_limits_have_secure_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Password recovery has default abuse-protection limits."""
+    monkeypatch.chdir(tmp_path)
+
+    for variable in (
+        "RESTLING_PASSWORD_RESET_COOLDOWN_SECONDS",
+        "RESTLING_PASSWORD_RESET_EMAIL_HOURLY_LIMIT",
+        "RESTLING_PASSWORD_RESET_IP_HOURLY_LIMIT",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    settings = make_settings("http://localhost:8000")
+
+    assert settings.password_reset_cooldown_seconds == 60
+    assert settings.password_reset_email_hourly_limit == 5
+    assert settings.password_reset_ip_hourly_limit == 20
+
+
+def test_password_reset_rate_limits_are_configurable() -> None:
+    """Administrators can configure password-recovery limits."""
+    settings = make_settings(
+        "http://localhost:8000",
+        RESTLING_PASSWORD_RESET_COOLDOWN_SECONDS=120,
+        RESTLING_PASSWORD_RESET_EMAIL_HOURLY_LIMIT=3,
+        RESTLING_PASSWORD_RESET_IP_HOURLY_LIMIT=10,
+    )
+
+    assert settings.password_reset_cooldown_seconds == 120
+    assert settings.password_reset_email_hourly_limit == 3
+    assert settings.password_reset_ip_hourly_limit == 10
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "RESTLING_PASSWORD_RESET_COOLDOWN_SECONDS",
+        "RESTLING_PASSWORD_RESET_EMAIL_HOURLY_LIMIT",
+        "RESTLING_PASSWORD_RESET_IP_HOURLY_LIMIT",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", [0, -1])
+def test_password_reset_rate_limits_reject_nonpositive_values(
+    setting: str,
+    invalid_value: int,
+) -> None:
+    """Password-recovery rate limits must remain enabled."""
+    with pytest.raises(ValidationError) as exc_info:
+        make_settings(
+            "http://localhost:8000",
+            **{setting: invalid_value},
+        )
+
+    assert any(
+        error["loc"] == (setting,) and error["type"] == "greater_than_equal"
+        for error in exc_info.value.errors()
+    )

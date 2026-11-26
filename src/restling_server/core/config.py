@@ -65,6 +65,24 @@ class Settings(BaseSettings):
         validation_alias="RESTLING_PASSWORD_RESET_EXPIRY_MINUTES",
     )
 
+    password_reset_cooldown_seconds: int = Field(
+        default=60,
+        ge=1,
+        validation_alias="RESTLING_PASSWORD_RESET_COOLDOWN_SECONDS",
+    )
+
+    password_reset_email_hourly_limit: int = Field(
+        default=5,
+        ge=1,
+        validation_alias="RESTLING_PASSWORD_RESET_EMAIL_HOURLY_LIMIT",
+    )
+
+    password_reset_ip_hourly_limit: int = Field(
+        default=20,
+        ge=1,
+        validation_alias="RESTLING_PASSWORD_RESET_IP_HOURLY_LIMIT",
+    )
+
     # Opaque authentication tokens and active-session limits.
     access_token_expiry_minutes: int = Field(
         default=15,
