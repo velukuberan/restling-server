@@ -121,6 +121,10 @@ class InvalidPasswordResetTokenError(Exception):
     """The password-reset credential is invalid or no longer usable."""
 
 
+class PasswordUnchangedError(Exception):
+    """The new password matches the current password."""
+
+
 class InvalidEmailChangeTokenError(Exception):
     """The email-change credential is invalid or no longer usable."""
 
@@ -1119,6 +1123,148 @@ def reset_user_password(
                 action="user.password_reset_completed",
             )
         )
+        session.flush()
+
+
+def change_user_password(
+    session: Session,
+    *,
+    access_token: str,
+    current_password: str,
+    new_password: str,
+) -> None:
+    """Change an authenticated user's password and revoke all sessions."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        # Identify the account associated with the access credential.
+        user_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if user_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Serialize account-level authentication and credential changes.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if (
+            user is None
+            or user.status != "active"
+            or user.password_reset_required
+            or user.password_hash is None
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Lock and revalidate the authenticated login session.
+        now = datetime.now(UTC)
+
+        current_session = session.scalar(
+            select(LoginSession)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+            .with_for_update(of=LoginSession)
+        )
+
+        if current_session is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        if current_session.revoked_at is not None or current_session.expires_at <= now:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        credential_id = session.scalar(
+            select(AccessToken.id).where(
+                AccessToken.session_id == current_session.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+            )
+        )
+
+        if credential_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Verify the user's current password.
+        if not verify_password(
+            current_password,
+            user.password_hash,
+        ):
+            raise InvalidCredentialsError("Invalid current password.")
+
+        # Enforce the existing password policy.
+        validate_password(new_password)
+
+        # Reject reuse of the current password, including
+        # canonically equivalent Unicode representations.
+        if verify_password(
+            new_password,
+            user.password_hash,
+        ):
+            raise PasswordUnchangedError(
+                "The new password must differ from the current password."
+            )
+
+        new_password_hash = hash_password(new_password)
+
+        # Invalidate outstanding password-reset and email-change credentials.
+        outstanding_tokens = session.scalars(
+            select(OneTimeToken)
+            .where(
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose.in_(("password_reset", "email_change")),
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+            .order_by(OneTimeToken.id)
+            .with_for_update()
+        ).all()
+
+        # Lock every non-revoked session, including the current session.
+        login_sessions = session.scalars(
+            select(LoginSession)
+            .where(
+                LoginSession.user_id == user.id,
+                LoginSession.revoked_at.is_(None),
+            )
+            .order_by(LoginSession.id)
+            .with_for_update()
+        ).all()
+
+        now = datetime.now(UTC)
+
+        for outstanding_token in outstanding_tokens:
+            outstanding_token.revoked_at = now
+
+        for login_session in login_sessions:
+            login_session.refresh_token_hash = None
+            login_session.revoked_at = now
+            login_session.revocation_reason = "password_changed"
+
+        user.password_hash = new_password_hash
+
+        session.add(
+            AuditLog(
+                actor_user_id=user.id,
+                target_user_id=user.id,
+                action="user.password_changed",
+            )
+        )
+
         session.flush()
 
 

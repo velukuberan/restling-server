@@ -53,6 +53,7 @@ from restling_server.users.schemas import (
     AdminChangeUserEmailRequest,
     AdministratorPasswordResetData,
     AdministratorPasswordResetResponse,
+    ChangePasswordRequest,
     CorrectPendingEmailRequest,
     CreateUserRequest,
     CreateUserResponse,
@@ -99,6 +100,7 @@ from restling_server.users.service import (
     InvitationRevocationNotAllowedError,
     LastAdministratorError,
     PasswordResetNotAllowedError,
+    PasswordUnchangedError,
     ProfileUpdateNotAllowedError,
     SessionLimitReachedError,
     SessionNotFoundError,
@@ -113,6 +115,7 @@ from restling_server.users.service import (
     authenticate_access_token,
     cancel_email_change,
     change_user_email_as_administrator,
+    change_user_password,
     correct_pending_user_email,
     create_user,
     get_user_detail,
@@ -306,6 +309,64 @@ def complete_password_reset(
     response.headers["Cache-Control"] = "no-store"
 
     return ResetPasswordResponse(message="Password reset successfully.")
+
+
+@router.post(
+    "/change-password",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def change_password(
+    payload: ChangePasswordRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+) -> Response:
+    """Change the authenticated user's password."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        change_user_password(
+            session,
+            access_token=credentials.credentials,
+            current_password=payload.current_password,
+            new_password=payload.new_password,
+        )
+
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    except PasswordUnchangedError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "PASSWORD_UNCHANGED",
+                    "message": (
+                        "The new password must differ from the current password."
+                    ),
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "PASSWORD_POLICY_VIOLATION",
+                    "message": "Password does not meet the required policy.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return Response(
+        status_code=204,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.post(

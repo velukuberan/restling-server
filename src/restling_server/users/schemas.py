@@ -33,6 +33,15 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    """Credentials submitted for an authenticated password change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str = Field(min_length=1, repr=False)
+    new_password: str = Field(repr=False)
+
+
 class ForgotPasswordRequest(BaseModel):
     """Request password recovery using an account email address."""
 
