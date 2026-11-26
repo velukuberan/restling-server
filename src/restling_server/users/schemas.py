@@ -33,6 +33,20 @@ class ResetPasswordResponse(BaseModel):
     message: str
 
 
+class AdministratorPasswordResetData(BaseModel):
+    """Manually deliverable password-reset credential."""
+
+    delivery: Literal["manual"]
+    reset_url: str
+    expires_at: datetime
+
+
+class AdministratorPasswordResetResponse(BaseModel):
+    """Response containing an administrator-issued reset link."""
+
+    data: AdministratorPasswordResetData
+
+
 class UserDetail(BaseModel):
     """Publicly exposed user profile fields."""
 

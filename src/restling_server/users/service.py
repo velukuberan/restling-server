@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+from restling_server.core.config import Settings
 from restling_server.users.models import (
     AccessToken,
     AuditLog,
@@ -29,6 +30,7 @@ from restling_server.users.models import (
     RefreshTokenHistory,
     User,
 )
+from restling_server.users.password_reset_links import build_password_reset_url
 from restling_server.users.passwords import (
     hash_password,
     validate_password,
@@ -106,6 +108,10 @@ class AdministratorSessionAccessNotAllowedError(Exception):
 
 class PasswordResetNotAllowedError(Exception):
     """The actor cannot issue a password-reset credential."""
+
+
+class AdministratorPasswordResetNotAllowedError(Exception):
+    """The actor cannot issue administrator-assisted reset credentials."""
 
 
 class InvalidPasswordResetTokenError(Exception):
@@ -745,6 +751,60 @@ def revoke_user_invitations(
         session.flush()
 
 
+def _issue_password_reset_token(
+    session: Session,
+    *,
+    actor_id: UUID,
+    user_id: UUID,
+    expiry_minutes: int,
+    now: datetime,
+) -> tuple[str, datetime]:
+    """Issue a reset credential within an existing write transaction."""
+    if expiry_minutes < 1:
+        raise ValueError("Password-reset expiry must be positive.")
+
+    existing_tokens = session.scalars(
+        select(OneTimeToken)
+        .where(
+            OneTimeToken.user_id == user_id,
+            OneTimeToken.purpose == "password_reset",
+            OneTimeToken.consumed_at.is_(None),
+            OneTimeToken.revoked_at.is_(None),
+        )
+        .order_by(OneTimeToken.id)
+        .with_for_update()
+    ).all()
+
+    for existing_token in existing_tokens:
+        existing_token.revoked_at = now
+
+    raw_token = generate_token()
+    expires_at = now + timedelta(minutes=expiry_minutes)
+
+    reset_token = OneTimeToken(
+        user_id=user_id,
+        purpose="password_reset",
+        token_hash=hash_token(raw_token),
+        pending_email=None,
+        created_at=now,
+        expires_at=expires_at,
+    )
+
+    session.add(reset_token)
+
+    session.add(
+        AuditLog(
+            actor_user_id=actor_id,
+            target_user_id=user_id,
+            action="user.password_reset_issued",
+        )
+    )
+
+    session.flush()
+
+    return raw_token, expires_at
+
+
 def issue_password_reset_token(
     session: Session,
     *,
@@ -767,7 +827,6 @@ def issue_password_reset_token(
         ):
             raise PasswordResetNotAllowedError("Administrator privileges are required.")
 
-        # Lock the user to serialize concurrent reset-token issuance.
         user = session.scalar(select(User).where(User.id == user_id).with_for_update())
 
         if user is None or user.status not in ("active", "suspended"):
@@ -775,44 +834,115 @@ def issue_password_reset_token(
                 "Account is not eligible for password recovery."
             )
 
-        now = datetime.now(UTC)
+        result = _issue_password_reset_token(
+            session,
+            actor_id=actor_id,
+            user_id=user.id,
+            expiry_minutes=expiry_minutes,
+            now=datetime.now(UTC),
+        )
 
-        # Invalidate all previously usable reset credentials.
-        existing_tokens = session.scalars(
-            select(OneTimeToken).where(
-                OneTimeToken.user_id == user.id,
-                OneTimeToken.purpose == "password_reset",
-                OneTimeToken.consumed_at.is_(None),
-                OneTimeToken.revoked_at.is_(None),
-            )
+    return result
+
+
+def issue_administrator_password_reset(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+    settings: Settings,
+) -> tuple[str, datetime]:
+    """Issue a manually deliverable password-reset link."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Acquire account locks in a consistent order.
+        locked_users = session.scalars(
+            select(User)
+            .where(User.id.in_([actor_id, user_id]))
+            .order_by(User.id)
+            .with_for_update()
         ).all()
 
-        for existing_token in existing_tokens:
-            existing_token.revoked_at = now
+        users_by_id = {user.id: user for user in locked_users}
 
-        raw_token = generate_token()
-        expires_at = now + timedelta(minutes=expiry_minutes)
+        actor = users_by_id.get(actor_id)
+        target = users_by_id.get(user_id)
 
-        reset_token = OneTimeToken(
-            user_id=user.id,
-            purpose="password_reset",
-            token_hash=hash_token(raw_token),
-            pending_email=None,
-            created_at=now,
-            expires_at=expires_at,
+        if actor is None or actor.status != "active" or actor.password_reset_required:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Lock and revalidate the administrator's login session.
+        now = datetime.now(UTC)
+
+        current_session = session.scalar(
+            select(LoginSession)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(
+                LoginSession.user_id == actor.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+            .with_for_update(of=LoginSession)
         )
 
-        session.add(reset_token)
-        session.add(
-            AuditLog(
-                actor_user_id=actor_id,
-                target_user_id=user_id,
-                action="user.password_reset_issued",
+        if current_session is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        if current_session.revoked_at is not None or current_session.expires_at <= now:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        credential_id = session.scalar(
+            select(AccessToken.id).where(
+                AccessToken.session_id == current_session.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
             )
         )
-        session.flush()
 
-    return raw_token, expires_at
+        if credential_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if actor.system_role != "administrator":
+            raise AdministratorPasswordResetNotAllowedError(
+                "Administrator privileges are required."
+            )
+
+        if target is None:
+            raise UserNotFoundError("User account not found.")
+
+        if target.status not in ("active", "suspended"):
+            raise PasswordResetNotAllowedError(
+                "Account is not eligible for password recovery."
+            )
+
+        raw_token, expires_at = _issue_password_reset_token(
+            session,
+            actor_id=actor.id,
+            user_id=target.id,
+            expiry_minutes=settings.password_reset_expiry_minutes,
+            now=now,
+        )
+
+        reset_url = build_password_reset_url(
+            settings,
+            token=raw_token,
+        )
+
+    return reset_url, expires_at
 
 
 def reset_user_password(

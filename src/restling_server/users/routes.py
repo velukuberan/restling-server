@@ -36,10 +36,15 @@ from restling_server.users.invitations import (
     deliver_corrected_activation_invitation,
     prepare_activation_invitation,
 )
+from restling_server.users.password_reset_links import (
+    PasswordResetURLNotConfiguredError,
+)
 from restling_server.users.schemas import (
     ActivateUserRequest,
     ActivateUserResponse,
     AdminChangeUserEmailRequest,
+    AdministratorPasswordResetData,
+    AdministratorPasswordResetResponse,
     CorrectPendingEmailRequest,
     CreateUserRequest,
     CreateUserResponse,
@@ -68,6 +73,7 @@ from restling_server.users.schemas import (
 )
 from restling_server.users.service import (
     AdministratorEmailChangeNotAllowedError,
+    AdministratorPasswordResetNotAllowedError,
     AdministratorProfileUpdateNotAllowedError,
     AdministratorSessionAccessNotAllowedError,
     EmailAlreadyExistsError,
@@ -82,6 +88,7 @@ from restling_server.users.service import (
     InvitationRevocationAccessDeniedError,
     InvitationRevocationNotAllowedError,
     LastAdministratorError,
+    PasswordResetNotAllowedError,
     ProfileUpdateNotAllowedError,
     SessionLimitReachedError,
     SessionNotFoundError,
@@ -99,6 +106,7 @@ from restling_server.users.service import (
     correct_pending_user_email,
     create_user,
     get_user_detail,
+    issue_administrator_password_reset,
     list_administrator_user_sessions,
     list_user_session_history,
     list_users,
@@ -1554,6 +1562,89 @@ def revoke_user_invitations_as_administrator(
     return Response(
         status_code=204,
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@users_router.post(
+    "/{user_id}/reset-password",
+    response_model=AdministratorPasswordResetResponse,
+    status_code=200,
+)
+def reset_user_password_as_administrator(
+    user_id: UUID,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    request: Request,
+    response: Response,
+) -> AdministratorPasswordResetResponse | JSONResponse:
+    """Issue a password-reset link for manual delivery."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    settings = cast(Settings, request.app.state.settings)
+
+    try:
+        reset_url, expires_at = issue_administrator_password_reset(
+            session,
+            access_token=credentials.credentials,
+            user_id=user_id,
+            settings=settings,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except AdministratorPasswordResetNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except PasswordResetNotAllowedError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "PASSWORD_RESET_NOT_ALLOWED",
+                    "message": "Account is not eligible for password recovery.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except PasswordResetURLNotConfiguredError:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "PASSWORD_RESET_UNAVAILABLE",
+                    "message": "Password recovery is not configured.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return AdministratorPasswordResetResponse(
+        data=AdministratorPasswordResetData(
+            delivery="manual",
+            reset_url=reset_url,
+            expires_at=expires_at,
+        )
     )
 
 
