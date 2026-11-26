@@ -3779,3 +3779,47 @@ def cleanup_inactive_sessions(
         )
 
         return len(session_ids)
+
+
+def cleanup_password_reset_attempts(
+    session: Session,
+    *,
+    now: datetime,
+    cooldown_seconds: int,
+    batch_size: int,
+) -> int:
+    """Delete one bounded batch of obsolete recovery attempts."""
+    if cooldown_seconds < 1:
+        raise ValueError("Password-reset cooldown must be positive.")
+
+    if batch_size < 1:
+        raise ValueError("Cleanup batch size must be positive.")
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Cleanup time must be timezone-aware.")
+
+    retention_seconds = max(3600, cooldown_seconds)
+
+    cutoff = now - timedelta(seconds=retention_seconds)
+
+    with session.begin():
+        attempt_ids = session.scalars(
+            select(PasswordResetAttempt.id)
+            .where(
+                PasswordResetAttempt.created_at <= cutoff,
+            )
+            .order_by(PasswordResetAttempt.id)
+            .limit(batch_size)
+            .with_for_update(skip_locked=True)
+        ).all()
+
+        if not attempt_ids:
+            return 0
+
+        session.execute(
+            delete(PasswordResetAttempt).where(
+                PasswordResetAttempt.id.in_(attempt_ids),
+            )
+        )
+
+        return len(attempt_ids)
