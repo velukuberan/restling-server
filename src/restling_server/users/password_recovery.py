@@ -2,7 +2,7 @@
 
 import logging
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from restling_server.core.config import Settings
 from restling_server.users.password_reset_email import (
@@ -95,3 +95,26 @@ def request_password_recovery(
             "Delivered password-reset credential discarded "
             "because account state changed."
         )
+
+
+def process_password_recovery_task(
+    session_factory: sessionmaker[Session],
+    *,
+    settings: Settings,
+    email: str,
+    source_ip: str,
+) -> None:
+    """Execute password recovery with an independently owned session."""
+    try:
+        with session_factory() as session:
+            request_password_recovery(
+                session,
+                settings=settings,
+                email=email,
+                source_ip=source_ip,
+            )
+
+    except Exception:
+        # The HTTP response has already been sent.
+        # Do not expose credentials or sensitive exception details.
+        logger.error("Background password-recovery processing failed.")

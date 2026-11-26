@@ -4,7 +4,13 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+)
 
 
 class ActivateUserRequest(BaseModel):
@@ -25,6 +31,20 @@ class ResetPasswordRequest(BaseModel):
 
     token: str = Field(min_length=1)
     new_password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Request password recovery using an account email address."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr = Field(repr=False)
+
+
+class ForgotPasswordResponse(BaseModel):
+    """Generic acknowledgement of a password-recovery request."""
+
+    message: str
 
 
 class ResetPasswordResponse(BaseModel):

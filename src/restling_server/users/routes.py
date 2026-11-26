@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     Query,
     Request,
@@ -13,8 +14,12 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
+from restling_server.core.client_ip import (
+    ClientIPResolutionError,
+    resolve_client_ip,
+)
 from restling_server.core.config import Settings
 from restling_server.core.dependencies import get_db_session
 from restling_server.users.activation_links import (
@@ -36,6 +41,9 @@ from restling_server.users.invitations import (
     deliver_corrected_activation_invitation,
     prepare_activation_invitation,
 )
+from restling_server.users.password_recovery import (
+    process_password_recovery_task,
+)
 from restling_server.users.password_reset_links import (
     PasswordResetURLNotConfiguredError,
 )
@@ -48,6 +56,8 @@ from restling_server.users.schemas import (
     CorrectPendingEmailRequest,
     CreateUserRequest,
     CreateUserResponse,
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
     LoginRequest,
     LoginResponse,
     LoginTokenData,
@@ -181,6 +191,76 @@ def activate_account(
     response.headers["Cache-Control"] = "no-store"
 
     return ActivateUserResponse(message="Account activated successfully.")
+
+
+@router.post(
+    "/forgot-password",
+    response_model=ForgotPasswordResponse,
+    status_code=202,
+)
+def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+) -> ForgotPasswordResponse | JSONResponse:
+    """Accept a public password-recovery request."""
+    settings = cast(Settings, request.app.state.settings)
+
+    if (
+        settings.smtp_host is None
+        or settings.smtp_from_email is None
+        or settings.public_url is None
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "PASSWORD_RECOVERY_UNAVAILABLE",
+                    "message": (
+                        "Email-based password recovery is unavailable. "
+                        "Contact your administrator."
+                    ),
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        source_ip = resolve_client_ip(request)
+
+    except ClientIPResolutionError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "CLIENT_IP_UNAVAILABLE",
+                    "message": "Unable to determine client IP address.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    session_factory = cast(
+        sessionmaker[Session],
+        request.app.state.session_factory,
+    )
+
+    background_tasks.add_task(
+        process_password_recovery_task,
+        session_factory,
+        settings=settings,
+        email=payload.email,
+        source_ip=source_ip,
+    )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return ForgotPasswordResponse(
+        message=(
+            "If the account is eligible, password reset instructions will be sent."
+        ),
+    )
 
 
 @router.post(
