@@ -1805,12 +1805,13 @@ def verify_email_change(
 
             stored_token.consumed_at = now
 
-            # Invalidate other outstanding email-change credentials.
+            # Invalidate outstanding credentials associated with
+            # the previous account email.
             other_tokens = session.scalars(
                 select(OneTimeToken)
                 .where(
                     OneTimeToken.user_id == user.id,
-                    OneTimeToken.purpose == "email_change",
+                    OneTimeToken.purpose.in_(("email_change", "password_reset")),
                     OneTimeToken.id != stored_token.id,
                     OneTimeToken.consumed_at.is_(None),
                     OneTimeToken.revoked_at.is_(None),
@@ -3541,11 +3542,13 @@ def change_user_email_as_administrator(
                     "A user with this email address already exists."
                 )
 
+            # Invalidate outstanding credentials associated with
+            # the previous account email.
             pending_tokens = session.scalars(
                 select(OneTimeToken)
                 .where(
                     OneTimeToken.user_id == target.id,
-                    OneTimeToken.purpose == "email_change",
+                    OneTimeToken.purpose.in_(("email_change", "password_reset")),
                     OneTimeToken.consumed_at.is_(None),
                     OneTimeToken.revoked_at.is_(None),
                 )

@@ -468,6 +468,7 @@ def test_admin_email_change_is_no_op_for_unchanged_email(
     admin_email = f"idempotent-admin-{key}@example.com"
     target_email = f"idempotent-target-{key}@example.com"
     raw_token = f"idempotent-token-{key}"
+    raw_reset_token = f"idempotent-reset-{key}"
     now = datetime.now(UTC)
 
     with Session(test_engine) as session:
@@ -498,6 +499,15 @@ def test_admin_email_change_is_no_op_for_unchanged_email(
                 purpose="email_change",
                 token_hash=hash_token(raw_token),
                 pending_email=f"pending-{key}@example.com",
+                created_at=now,
+                expires_at=now + timedelta(minutes=30),
+            )
+        )
+        session.add(
+            OneTimeToken(
+                user_id=target_id,
+                purpose="password_reset",
+                token_hash=hash_token(raw_reset_token),
                 created_at=now,
                 expires_at=now + timedelta(minutes=30),
             )
@@ -555,6 +565,16 @@ def test_admin_email_change_is_no_op_for_unchanged_email(
         assert pending_token.revoked_at is None
         assert pending_token.consumed_at is None
 
+        reset_token = session.scalar(
+            select(OneTimeToken).where(
+                OneTimeToken.token_hash == hash_token(raw_reset_token),
+            )
+        )
+
+        assert reset_token is not None
+        assert reset_token.revoked_at is None
+        assert reset_token.consumed_at is None
+
         events = session.scalars(
             select(AuditLog).where(
                 AuditLog.target_user_id == target_id,
@@ -571,6 +591,16 @@ def test_admin_email_change_is_no_op_for_unchanged_email(
     )
 
     assert profile_response.status_code == 200
+
+    reset_response = api_client.post(
+        "/api/v1/auth/reset-password",
+        json={
+            "token": raw_reset_token,
+            "new_password": "Another secure recovery passphrase #9274",
+        },
+    )
+
+    assert reset_response.status_code == 200
 
 
 @pytest.mark.parametrize(
@@ -833,6 +863,7 @@ def test_admin_email_change_rolls_back_on_transaction_failure(
     old_email = f"rollback-target-{key}@example.com"
     new_email = f"rollback-new-{key}@example.com"
     raw_pending_token = f"rollback-pending-{key}"
+    raw_reset_token = f"rollback-reset-{key}"
     now = datetime.now(UTC)
 
     with Session(test_engine) as session:
@@ -863,6 +894,15 @@ def test_admin_email_change_rolls_back_on_transaction_failure(
                 purpose="email_change",
                 token_hash=hash_token(raw_pending_token),
                 pending_email=f"pending-{key}@example.com",
+                created_at=now,
+                expires_at=now + timedelta(minutes=30),
+            )
+        )
+        session.add(
+            OneTimeToken(
+                user_id=target_id,
+                purpose="password_reset",
+                token_hash=hash_token(raw_reset_token),
                 created_at=now,
                 expires_at=now + timedelta(minutes=30),
             )
@@ -923,6 +963,16 @@ def test_admin_email_change_rolls_back_on_transaction_failure(
         assert pending_token.revoked_at is None
         assert pending_token.consumed_at is None
 
+        reset_token = session.scalar(
+            select(OneTimeToken).where(
+                OneTimeToken.token_hash == hash_token(raw_reset_token),
+            )
+        )
+
+        assert reset_token is not None
+        assert reset_token.revoked_at is None
+        assert reset_token.consumed_at is None
+
         active_sessions = session.scalars(
             select(LoginSession).where(
                 LoginSession.user_id == target_id,
@@ -948,6 +998,16 @@ def test_admin_email_change_rolls_back_on_transaction_failure(
     )
 
     assert profile_response.status_code == 200
+
+    reset_response = api_client.post(
+        "/api/v1/auth/reset-password",
+        json={
+            "token": raw_reset_token,
+            "new_password": "Another secure recovery passphrase #9274",
+        },
+    )
+
+    assert reset_response.status_code == 200
 
 
 def test_administrator_can_change_own_email(
@@ -1365,3 +1425,144 @@ def test_password_reset_required_administrator_cannot_change_user_email(
         ).all()
 
         assert events == []
+
+
+@pytest.mark.parametrize(
+    "token_state",
+    ["active", "expired", "consumed", "revoked"],
+)
+def test_admin_email_change_invalidates_outstanding_password_reset(
+    api_client: TestClient,
+    test_engine: Engine,
+    token_state: str,
+) -> None:
+    """Administrator email changes revoke outstanding reset credentials."""
+    key = uuid7().hex
+    password = "A secure administrator recovery test passphrase"
+
+    admin_email = f"reset-admin-{key}@example.com"
+    old_email = f"reset-old-{key}@example.com"
+    new_email = f"reset-new-{key}@example.com"
+    raw_reset_token = f"password-reset-{key}"
+
+    now = datetime.now(UTC)
+    created_at = now - timedelta(minutes=10)
+    expires_at = now + timedelta(minutes=20)
+
+    consumed_at = None
+    revoked_at = None
+
+    if token_state == "expired":
+        created_at = now - timedelta(minutes=60)
+        expires_at = now - timedelta(minutes=30)
+
+    elif token_state == "consumed":
+        consumed_at = now - timedelta(minutes=5)
+
+    elif token_state == "revoked":
+        revoked_at = now - timedelta(minutes=5)
+
+    with Session(test_engine) as session:
+        administrator = User(
+            email=admin_email,
+            normalized_email=admin_email,
+            display_name="Administrator",
+            status="active",
+            system_role="administrator",
+            password_hash=hash_password(password),
+        )
+
+        target = User(
+            email=old_email,
+            normalized_email=old_email,
+            display_name="Password Reset Revocation Test User",
+            status="active",
+            system_role="user",
+            password_hash=hash_password(password),
+        )
+
+        session.add_all([administrator, target])
+        session.flush()
+
+        target_id = target.id
+
+        reset_token = OneTimeToken(
+            user_id=target_id,
+            purpose="password_reset",
+            token_hash=hash_token(raw_reset_token),
+            created_at=created_at,
+            expires_at=expires_at,
+            consumed_at=consumed_at,
+            revoked_at=revoked_at,
+        )
+
+        session.add(reset_token)
+        session.flush()
+
+        reset_token_id = reset_token.id
+
+        session.commit()
+
+    login = api_client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": admin_email,
+            "password": password,
+        },
+    )
+
+    assert login.status_code == 200
+
+    access_token = login.json()["data"]["access_token"]
+
+    response = api_client.patch(
+        f"/api/v1/users/{target_id}/email",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+        },
+        json={
+            "email": new_email,
+            "current_password": password,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["email"] == new_email
+    assert response.headers["cache-control"] == "no-store"
+
+    with Session(test_engine) as session:
+        stored_target = session.get(User, target_id)
+
+        assert stored_target is not None
+        assert stored_target.email == new_email
+        assert stored_target.normalized_email == new_email
+
+        stored_reset = session.get(
+            OneTimeToken,
+            reset_token_id,
+        )
+
+        assert stored_reset is not None
+        assert stored_reset.token_hash == hash_token(raw_reset_token)
+        assert stored_reset.created_at == created_at
+        assert stored_reset.expires_at == expires_at
+        assert stored_reset.consumed_at == consumed_at
+
+        if token_state in ("active", "expired"):
+            assert stored_reset.revoked_at is not None
+            assert stored_reset.revoked_at >= now
+
+        else:
+            assert stored_reset.revoked_at == revoked_at
+
+    reset_response = api_client.post(
+        "/api/v1/auth/reset-password",
+        json={
+            "token": raw_reset_token,
+            "new_password": "Another secure recovery passphrase #9274",
+        },
+    )
+
+    assert reset_response.status_code == 400
+
+    assert reset_response.json()["error"]["code"] == ("INVALID_PASSWORD_RESET_TOKEN")
