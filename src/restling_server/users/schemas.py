@@ -4,7 +4,13 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+)
 
 
 class ActivateUserRequest(BaseModel):
@@ -27,10 +33,47 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    """Credentials submitted for an authenticated password change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str = Field(min_length=1, repr=False)
+    new_password: str = Field(repr=False)
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Request password recovery using an account email address."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr = Field(repr=False)
+
+
+class ForgotPasswordResponse(BaseModel):
+    """Generic acknowledgement of a password-recovery request."""
+
+    message: str
+
+
 class ResetPasswordResponse(BaseModel):
     """Successful password recovery response."""
 
     message: str
+
+
+class AdministratorPasswordResetData(BaseModel):
+    """Manually deliverable password-reset credential."""
+
+    delivery: Literal["manual"]
+    reset_url: str
+    expires_at: datetime
+
+
+class AdministratorPasswordResetResponse(BaseModel):
+    """Response containing an administrator-issued reset link."""
+
+    data: AdministratorPasswordResetData
 
 
 class UserDetail(BaseModel):

@@ -901,3 +901,237 @@ def test_email_change_notifies_previous_email_address(
         assert stored_user is not None
         assert stored_user.email == new_email
         assert stored_user.normalized_email == new_email
+
+
+@pytest.mark.parametrize(
+    "token_state",
+    ["active", "expired", "consumed", "revoked"],
+)
+def test_verified_email_change_invalidates_outstanding_password_reset(
+    api_client: TestClient,
+    test_engine: Engine,
+    token_state: str,
+) -> None:
+    """Email changes revoke outstanding reset credentials."""
+    key = uuid7().hex
+    old_email = f"reset-old-{key}@example.com"
+    new_email = f"reset-new-{key}@example.com"
+    password = "A secure email change recovery passphrase"
+    raw_verification_token = f"email-verification-{key}"
+    raw_reset_token = f"password-reset-{key}"
+
+    now = datetime.now(UTC)
+    created_at = now - timedelta(minutes=10)
+    expires_at = now + timedelta(minutes=20)
+
+    consumed_at = None
+    revoked_at = None
+
+    if token_state == "expired":
+        created_at = now - timedelta(minutes=60)
+        expires_at = now - timedelta(minutes=30)
+
+    elif token_state == "consumed":
+        consumed_at = now - timedelta(minutes=5)
+
+    elif token_state == "revoked":
+        revoked_at = now - timedelta(minutes=5)
+
+    with Session(test_engine) as session:
+        user = User(
+            email=old_email,
+            normalized_email=old_email,
+            display_name="Password Reset Revocation Test User",
+            status="active",
+            system_role="user",
+            password_hash=hash_password(password),
+        )
+
+        session.add(user)
+        session.flush()
+
+        user_id = user.id
+
+        verification_token = OneTimeToken(
+            user_id=user_id,
+            purpose="email_change",
+            token_hash=hash_token(raw_verification_token),
+            pending_email=new_email,
+            created_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+
+        reset_token = OneTimeToken(
+            user_id=user_id,
+            purpose="password_reset",
+            token_hash=hash_token(raw_reset_token),
+            created_at=created_at,
+            expires_at=expires_at,
+            consumed_at=consumed_at,
+            revoked_at=revoked_at,
+        )
+
+        session.add_all(
+            [
+                verification_token,
+                reset_token,
+            ]
+        )
+
+        session.flush()
+
+        verification_token_id = verification_token.id
+        reset_token_id = reset_token.id
+
+        session.commit()
+
+    response = api_client.post(
+        "/api/v1/auth/verify-email-change",
+        json={"token": raw_verification_token},
+    )
+
+    assert response.status_code == 200
+
+    with Session(test_engine) as session:
+        user = session.get(User, user_id)
+
+        assert user is not None
+        assert user.email == new_email
+        assert user.normalized_email == new_email
+
+        stored_verification = session.get(
+            OneTimeToken,
+            verification_token_id,
+        )
+
+        assert stored_verification is not None
+        assert stored_verification.consumed_at is not None
+        assert stored_verification.revoked_at is None
+
+        stored_reset = session.get(
+            OneTimeToken,
+            reset_token_id,
+        )
+
+        assert stored_reset is not None
+        assert stored_reset.token_hash == hash_token(raw_reset_token)
+        assert stored_reset.created_at == created_at
+        assert stored_reset.expires_at == expires_at
+        assert stored_reset.consumed_at == consumed_at
+
+        if token_state in ("active", "expired"):
+            assert stored_reset.revoked_at is not None
+            assert stored_reset.revoked_at == stored_verification.consumed_at
+
+        else:
+            # Previously consumed or revoked credentials must
+            # retain their historical lifecycle information.
+            assert stored_reset.revoked_at == revoked_at
+
+    reset_response = api_client.post(
+        "/api/v1/auth/reset-password",
+        json={
+            "token": raw_reset_token,
+            "new_password": "Another secure recovery passphrase #9274",
+        },
+    )
+
+    assert reset_response.status_code == 400
+
+    assert reset_response.json()["error"]["code"] == ("INVALID_PASSWORD_RESET_TOKEN")
+
+
+def test_failed_email_change_preserves_password_reset_credential(
+    api_client: TestClient,
+    test_engine: Engine,
+) -> None:
+    """Failed verification must not revoke an existing reset credential."""
+    key = uuid7().hex
+    old_email = f"failed-old-{key}@example.com"
+    new_email = f"failed-new-{key}@example.com"
+
+    raw_verification_token = f"expired-verification-{key}"
+    raw_reset_token = f"valid-password-reset-{key}"
+
+    now = datetime.now(UTC)
+
+    with Session(test_engine) as session:
+        user = User(
+            email=old_email,
+            normalized_email=old_email,
+            display_name="Failed Email Change Recovery Test User",
+            status="active",
+            system_role="user",
+            password_hash=hash_password("A secure failed verification passphrase"),
+        )
+
+        session.add(user)
+        session.flush()
+
+        user_id = user.id
+
+        verification_token = OneTimeToken(
+            user_id=user_id,
+            purpose="email_change",
+            token_hash=hash_token(raw_verification_token),
+            pending_email=new_email,
+            created_at=now - timedelta(minutes=60),
+            expires_at=now - timedelta(minutes=30),
+        )
+
+        reset_token = OneTimeToken(
+            user_id=user_id,
+            purpose="password_reset",
+            token_hash=hash_token(raw_reset_token),
+            created_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+
+        session.add_all(
+            [
+                verification_token,
+                reset_token,
+            ]
+        )
+
+        session.flush()
+
+        reset_token_id = reset_token.id
+
+        session.commit()
+
+    response = api_client.post(
+        "/api/v1/auth/verify-email-change",
+        json={"token": raw_verification_token},
+    )
+
+    assert response.status_code == 400
+
+    assert response.json()["error"]["code"] == ("INVALID_EMAIL_CHANGE_TOKEN")
+
+    with Session(test_engine) as session:
+        user = session.get(User, user_id)
+
+        assert user is not None
+        assert user.email == old_email
+        assert user.normalized_email == old_email
+
+        stored_reset = session.get(
+            OneTimeToken,
+            reset_token_id,
+        )
+
+        assert stored_reset is not None
+        assert stored_reset.revoked_at is None
+        assert stored_reset.consumed_at is None
+
+    # The existing reset credential must remain usable.
+    reset_response = api_client.post(
+        "/api/v1/auth/reset-password",
+        json={
+            "token": raw_reset_token,
+            "new_password": "Another secure recovery passphrase #9274",
+        },
+    )
+
+    assert reset_response.status_code == 200

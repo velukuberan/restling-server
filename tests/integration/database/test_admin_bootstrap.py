@@ -207,22 +207,23 @@ def test_bootstrap_waits_for_advisory_lock(
     backend_pids: Queue[int] = Queue()
 
     def attempt_bootstrap() -> None:
-        with Session(test_engine) as session:
-            # Identify this connection in pg_stat_activity.
-            pid = session.scalar(text("SELECT pg_backend_pid()"))
-            assert isinstance(pid, int)
+        with test_engine.connect() as connection:
+            with Session(bind=connection) as session:
+                # Identify the dedicated PostgreSQL connection.
+                pid = session.scalar(text("SELECT pg_backend_pid()"))
+                assert isinstance(pid, int)
 
-            # End the identification query's transaction so that
-            # bootstrap_administrator() can own its transaction.
-            session.rollback()
-            backend_pids.put(pid)
+                # End the identification transaction without
+                # returning the dedicated connection to the pool.
+                session.rollback()
+                backend_pids.put(pid)
 
-            bootstrap_administrator(
-                session,
-                email=email,
-                display_name="Lock Contention Administrator",
-                password="A unique administrator passphrase #8472",
-            )
+                bootstrap_administrator(
+                    session,
+                    email=email,
+                    display_name="Lock Contention Administrator",
+                    password="A unique administrator passphrase #8472",
+                )
 
     try:
         # This test requires an uninitialized test database.

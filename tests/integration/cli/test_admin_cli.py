@@ -22,6 +22,7 @@ from restling_server.users.models import (
     AccessToken,
     LoginSession,
     OneTimeToken,
+    PasswordResetAttempt,
     RefreshTokenHistory,
     User,
 )
@@ -1363,10 +1364,15 @@ def test_cleanup_auth_cli_rejects_overlapping_run(
             assert released is True
 
 
+@pytest.mark.parametrize(
+    "failure_table",
+    ["one_time_tokens", "password_reset_attempts"],
+)
 def test_cleanup_auth_cli_releases_lock_after_database_failure(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     test_engine: Engine,
+    failure_table: str,
 ) -> None:
     """A database failure must not leave the cleanup lock held."""
     settings = Settings.model_validate(
@@ -1401,7 +1407,7 @@ def test_cleanup_auth_cli_releases_lock_after_database_failure(
         context: Any,
         executemany: bool,
     ) -> None:
-        if "FROM one_time_tokens" in statement:
+        if f"FROM {failure_table}" in statement:
             raise SQLAlchemyError("Simulated database failure")
 
     event.listen(
@@ -1619,3 +1625,104 @@ def test_cleanup_auth_cli_deletes_inactive_sessions(
         assert session.get(LoginSession, old_session_id) is None
         assert session.get(RefreshTokenHistory, history_id) is None
         assert session.get(LoginSession, active_session_id) is not None
+
+
+@pytest.mark.parametrize(
+    ("cooldown_seconds", "retention_seconds"),
+    [
+        (60, 3600),
+        (7200, 7200),
+    ],
+)
+def test_cleanup_auth_cli_deletes_obsolete_password_reset_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    test_engine: Engine,
+    cooldown_seconds: int,
+    retention_seconds: int,
+) -> None:
+    """CLI removes obsolete attempts using the configured cooldown."""
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=retention_seconds)
+
+    email_key = hash_token("recovery@example.com")
+
+    with Session(test_engine) as session:
+        with session.begin():
+            obsolete_attempt = PasswordResetAttempt(
+                email_key=email_key,
+                source_ip="192.0.2.10",
+                created_at=cutoff - timedelta(minutes=5),
+            )
+
+            retained_attempt = PasswordResetAttempt(
+                email_key=email_key,
+                source_ip="192.0.2.10",
+                created_at=cutoff + timedelta(minutes=5),
+            )
+
+            recent_attempt = PasswordResetAttempt(
+                email_key=email_key,
+                source_ip="192.0.2.10",
+                created_at=now,
+            )
+
+            session.add_all(
+                [
+                    obsolete_attempt,
+                    retained_attempt,
+                    recent_attempt,
+                ]
+            )
+
+            session.flush()
+
+            obsolete_id = obsolete_attempt.id
+            retained_id = retained_attempt.id
+            recent_id = recent_attempt.id
+
+    settings = Settings.model_validate(
+        {
+            "postgres_user": "test_user",
+            "postgres_password": "test_password",
+            "postgres_db": "test_db",
+            "RESTLING_PASSWORD_RESET_COOLDOWN_SECONDS": cooldown_seconds,
+        }
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["restling-admin", "cleanup-auth"],
+    )
+
+    monkeypatch.setattr(cli, "Settings", lambda: settings)
+
+    def use_test_engine(_settings: object) -> Engine:
+        return test_engine
+
+    monkeypatch.setattr(
+        cli,
+        "create_database_engine",
+        use_test_engine,
+    )
+
+    cli.main()
+
+    captured = capsys.readouterr()
+
+    assert "Authentication tokens deleted: 0" in captured.out
+    assert "Inactive sessions deleted: 0" in captured.out
+    assert "Password-recovery attempts deleted: 1" in captured.out
+    assert captured.err == ""
+
+    with Session(test_engine) as session:
+        assert session.get(PasswordResetAttempt, obsolete_id) is None
+
+        assert session.get(PasswordResetAttempt, retained_id) is not None
+
+        assert session.get(PasswordResetAttempt, recent_id) is not None
+
+        remaining_ids = set(session.scalars(select(PasswordResetAttempt.id)).all())
+
+        assert remaining_ids == {retained_id, recent_id}

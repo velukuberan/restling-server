@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     Query,
     Request,
@@ -13,8 +14,12 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
+from restling_server.core.client_ip import (
+    ClientIPResolutionError,
+    resolve_client_ip,
+)
 from restling_server.core.config import Settings
 from restling_server.core.dependencies import get_db_session
 from restling_server.users.activation_links import (
@@ -36,13 +41,24 @@ from restling_server.users.invitations import (
     deliver_corrected_activation_invitation,
     prepare_activation_invitation,
 )
+from restling_server.users.password_recovery import (
+    process_password_recovery_task,
+)
+from restling_server.users.password_reset_links import (
+    PasswordResetURLNotConfiguredError,
+)
 from restling_server.users.schemas import (
     ActivateUserRequest,
     ActivateUserResponse,
     AdminChangeUserEmailRequest,
+    AdministratorPasswordResetData,
+    AdministratorPasswordResetResponse,
+    ChangePasswordRequest,
     CorrectPendingEmailRequest,
     CreateUserRequest,
     CreateUserResponse,
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
     LoginRequest,
     LoginResponse,
     LoginTokenData,
@@ -68,6 +84,7 @@ from restling_server.users.schemas import (
 )
 from restling_server.users.service import (
     AdministratorEmailChangeNotAllowedError,
+    AdministratorPasswordResetNotAllowedError,
     AdministratorProfileUpdateNotAllowedError,
     AdministratorSessionAccessNotAllowedError,
     EmailAlreadyExistsError,
@@ -82,6 +99,8 @@ from restling_server.users.service import (
     InvitationRevocationAccessDeniedError,
     InvitationRevocationNotAllowedError,
     LastAdministratorError,
+    PasswordResetNotAllowedError,
+    PasswordUnchangedError,
     ProfileUpdateNotAllowedError,
     SessionLimitReachedError,
     SessionNotFoundError,
@@ -96,9 +115,11 @@ from restling_server.users.service import (
     authenticate_access_token,
     cancel_email_change,
     change_user_email_as_administrator,
+    change_user_password,
     correct_pending_user_email,
     create_user,
     get_user_detail,
+    issue_administrator_password_reset,
     list_administrator_user_sessions,
     list_user_session_history,
     list_users,
@@ -176,6 +197,76 @@ def activate_account(
 
 
 @router.post(
+    "/forgot-password",
+    response_model=ForgotPasswordResponse,
+    status_code=202,
+)
+def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+) -> ForgotPasswordResponse | JSONResponse:
+    """Accept a public password-recovery request."""
+    settings = cast(Settings, request.app.state.settings)
+
+    if (
+        settings.smtp_host is None
+        or settings.smtp_from_email is None
+        or settings.public_url is None
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "PASSWORD_RECOVERY_UNAVAILABLE",
+                    "message": (
+                        "Email-based password recovery is unavailable. "
+                        "Contact your administrator."
+                    ),
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        source_ip = resolve_client_ip(request)
+
+    except ClientIPResolutionError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "CLIENT_IP_UNAVAILABLE",
+                    "message": "Unable to determine client IP address.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    session_factory = cast(
+        sessionmaker[Session],
+        request.app.state.session_factory,
+    )
+
+    background_tasks.add_task(
+        process_password_recovery_task,
+        session_factory,
+        settings=settings,
+        email=payload.email,
+        source_ip=source_ip,
+    )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return ForgotPasswordResponse(
+        message=(
+            "If the account is eligible, password reset instructions will be sent."
+        ),
+    )
+
+
+@router.post(
     "/reset-password",
     response_model=ResetPasswordResponse,
     status_code=200,
@@ -218,6 +309,64 @@ def complete_password_reset(
     response.headers["Cache-Control"] = "no-store"
 
     return ResetPasswordResponse(message="Password reset successfully.")
+
+
+@router.post(
+    "/change-password",
+    status_code=204,
+    response_class=Response,
+    response_model=None,
+)
+def change_password(
+    payload: ChangePasswordRequest,
+    credentials: LogoutCredentials,
+    session: DbSession,
+) -> Response:
+    """Change the authenticated user's password."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    try:
+        change_user_password(
+            session,
+            access_token=credentials.credentials,
+            current_password=payload.current_password,
+            new_password=payload.new_password,
+        )
+
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+
+    except PasswordUnchangedError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "PASSWORD_UNCHANGED",
+                    "message": (
+                        "The new password must differ from the current password."
+                    ),
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "PASSWORD_POLICY_VIOLATION",
+                    "message": "Password does not meet the required policy.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return Response(
+        status_code=204,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.post(
@@ -1554,6 +1703,89 @@ def revoke_user_invitations_as_administrator(
     return Response(
         status_code=204,
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@users_router.post(
+    "/{user_id}/reset-password",
+    response_model=AdministratorPasswordResetResponse,
+    status_code=200,
+)
+def reset_user_password_as_administrator(
+    user_id: UUID,
+    credentials: LogoutCredentials,
+    session: DbSession,
+    request: Request,
+    response: Response,
+) -> AdministratorPasswordResetResponse | JSONResponse:
+    """Issue a password-reset link for manual delivery."""
+    if credentials is None:
+        return unauthorized_logout_response()
+
+    settings = cast(Settings, request.app.state.settings)
+
+    try:
+        reset_url, expires_at = issue_administrator_password_reset(
+            session,
+            access_token=credentials.credentials,
+            user_id=user_id,
+            settings=settings,
+        )
+    except InvalidCredentialsError:
+        return unauthorized_logout_response()
+    except AdministratorPasswordResetNotAllowedError:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "Administrator privileges are required.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except UserNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "USER_NOT_FOUND",
+                    "message": "User account not found.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except PasswordResetNotAllowedError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "PASSWORD_RESET_NOT_ALLOWED",
+                    "message": "Account is not eligible for password recovery.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except PasswordResetURLNotConfiguredError:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "PASSWORD_RESET_UNAVAILABLE",
+                    "message": "Password recovery is not configured.",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return AdministratorPasswordResetResponse(
+        data=AdministratorPasswordResetData(
+            delivery="manual",
+            reset_url=reset_url,
+            expires_at=expires_at,
+        )
     )
 
 

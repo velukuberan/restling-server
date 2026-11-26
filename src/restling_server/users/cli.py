@@ -33,6 +33,7 @@ from restling_server.users.service import (
     cleanup_expired_access_tokens,
     cleanup_inactive_sessions,
     cleanup_one_time_tokens,
+    cleanup_password_reset_attempts,
 )
 
 
@@ -127,7 +128,7 @@ def main() -> None:
 
     subparsers.add_parser(
         "cleanup-auth",
-        help="Remove expired and retained authentication tokens.",
+        help="Remove obsolete authentication and recovery records.",
     )
 
     invite_parser = subparsers.add_parser(
@@ -342,10 +343,30 @@ def main() -> None:
                         if deleted_count < batch_size:
                             break
 
+                    # Clean up obsolete password-recovery attempts.
+                    recovery_attempts_deleted = 0
+
+                    while True:
+                        with session_factory() as session:
+                            deleted_count = cleanup_password_reset_attempts(
+                                session,
+                                now=now,
+                                cooldown_seconds=settings.password_reset_cooldown_seconds,
+                                batch_size=batch_size,
+                            )
+
+                        recovery_attempts_deleted += deleted_count
+
+                        if deleted_count < batch_size:
+                            break
+
                     total_tokens_deleted = one_time_deleted + access_deleted
 
                     print(f"Authentication tokens deleted: {total_tokens_deleted}")
                     print(f"Inactive sessions deleted: {sessions_deleted}")
+                    print(
+                        f"Password-recovery attempts deleted: {recovery_attempts_deleted}"
+                    )
 
                 finally:
                     lock_connection.scalar(text("SELECT pg_advisory_unlock(723941, 3)"))

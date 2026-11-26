@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from ipaddress import IPv6Address, ip_address
 from typing import Literal
 from uuid import UUID
 
@@ -20,15 +22,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+from restling_server.core.config import Settings
 from restling_server.users.models import (
     AccessToken,
     AuditLog,
     EmailChangeDeliveryAttempt,
     LoginSession,
     OneTimeToken,
+    PasswordResetAttempt,
     RefreshTokenHistory,
     User,
 )
+from restling_server.users.password_reset_links import build_password_reset_url
 from restling_server.users.passwords import (
     hash_password,
     validate_password,
@@ -108,8 +113,16 @@ class PasswordResetNotAllowedError(Exception):
     """The actor cannot issue a password-reset credential."""
 
 
+class AdministratorPasswordResetNotAllowedError(Exception):
+    """The actor cannot issue administrator-assisted reset credentials."""
+
+
 class InvalidPasswordResetTokenError(Exception):
     """The password-reset credential is invalid or no longer usable."""
+
+
+class PasswordUnchangedError(Exception):
+    """The new password matches the current password."""
 
 
 class InvalidEmailChangeTokenError(Exception):
@@ -202,6 +215,17 @@ class SessionHistoryPage:
 
     items: list[SessionHistoryItem]
     total: int
+
+
+@dataclass(frozen=True)
+class PasswordRecoveryState:
+    """Account state captured before password-reset email delivery."""
+
+    user_id: UUID
+    recipient: str
+    normalized_email: str
+    updated_at: datetime
+    reset_token_ids: tuple[UUID, ...]
 
 
 def bootstrap_administrator(
@@ -745,6 +769,129 @@ def revoke_user_invitations(
         session.flush()
 
 
+def _issue_password_reset_token(
+    session: Session,
+    *,
+    actor_id: UUID | None,
+    user_id: UUID,
+    expiry_minutes: int,
+    now: datetime,
+    raw_token: str | None = None,
+) -> tuple[str, datetime]:
+    """Issue a reset credential within an existing write transaction."""
+    if expiry_minutes < 1:
+        raise ValueError("Password-reset expiry must be positive.")
+
+    existing_tokens = session.scalars(
+        select(OneTimeToken)
+        .where(
+            OneTimeToken.user_id == user_id,
+            OneTimeToken.purpose == "password_reset",
+            OneTimeToken.consumed_at.is_(None),
+            OneTimeToken.revoked_at.is_(None),
+        )
+        .order_by(OneTimeToken.id)
+        .with_for_update()
+    ).all()
+
+    for existing_token in existing_tokens:
+        existing_token.revoked_at = now
+
+    if raw_token is None:
+        raw_token = generate_token()
+
+    expires_at = now + timedelta(minutes=expiry_minutes)
+
+    reset_token = OneTimeToken(
+        user_id=user_id,
+        purpose="password_reset",
+        token_hash=hash_token(raw_token),
+        pending_email=None,
+        created_at=now,
+        expires_at=expires_at,
+    )
+
+    session.add(reset_token)
+
+    session.add(
+        AuditLog(
+            actor_user_id=actor_id,
+            target_user_id=user_id,
+            action="user.password_reset_issued",
+        )
+    )
+
+    session.flush()
+
+    return raw_token, expires_at
+
+
+def _password_reset_lock_key(
+    dimension: Literal["email", "ip"],
+    value: str,
+) -> int:
+    """Derive a stable PostgreSQL advisory-lock identifier."""
+    digest = sha256(f"restling:password-reset:{dimension}:{value}".encode()).digest()
+
+    return int.from_bytes(
+        digest[:8],
+        byteorder="big",
+        signed=True,
+    )
+
+
+def commit_password_reset_token_after_delivery(
+    session: Session,
+    *,
+    expected_state: PasswordRecoveryState,
+    raw_token: str,
+    expiry_minutes: int,
+) -> bool:
+    """Persist a delivered credential if account state remains valid."""
+    if expiry_minutes < 1:
+        raise ValueError("Password-reset expiry must be positive.")
+
+    with session.begin():
+        user = session.scalar(
+            select(User).where(User.id == expected_state.user_id).with_for_update()
+        )
+
+        if user is None or user.status not in ("active", "suspended"):
+            return False
+
+        if (
+            user.email != expected_state.recipient
+            or user.normalized_email != expected_state.normalized_email
+            or user.updated_at != expected_state.updated_at
+        ):
+            return False
+
+        current_token_ids = session.scalars(
+            select(OneTimeToken.id)
+            .where(
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose == "password_reset",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+            .order_by(OneTimeToken.id)
+        ).all()
+
+        if tuple(current_token_ids) != expected_state.reset_token_ids:
+            return False
+
+        _issue_password_reset_token(
+            session,
+            actor_id=None,
+            user_id=user.id,
+            expiry_minutes=expiry_minutes,
+            now=datetime.now(UTC),
+            raw_token=raw_token,
+        )
+
+    return True
+
+
 def issue_password_reset_token(
     session: Session,
     *,
@@ -767,7 +914,6 @@ def issue_password_reset_token(
         ):
             raise PasswordResetNotAllowedError("Administrator privileges are required.")
 
-        # Lock the user to serialize concurrent reset-token issuance.
         user = session.scalar(select(User).where(User.id == user_id).with_for_update())
 
         if user is None or user.status not in ("active", "suspended"):
@@ -775,44 +921,115 @@ def issue_password_reset_token(
                 "Account is not eligible for password recovery."
             )
 
-        now = datetime.now(UTC)
+        result = _issue_password_reset_token(
+            session,
+            actor_id=actor_id,
+            user_id=user.id,
+            expiry_minutes=expiry_minutes,
+            now=datetime.now(UTC),
+        )
 
-        # Invalidate all previously usable reset credentials.
-        existing_tokens = session.scalars(
-            select(OneTimeToken).where(
-                OneTimeToken.user_id == user.id,
-                OneTimeToken.purpose == "password_reset",
-                OneTimeToken.consumed_at.is_(None),
-                OneTimeToken.revoked_at.is_(None),
-            )
+    return result
+
+
+def issue_administrator_password_reset(
+    session: Session,
+    *,
+    access_token: str,
+    user_id: UUID,
+    settings: Settings,
+) -> tuple[str, datetime]:
+    """Issue a manually deliverable password-reset link."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        actor_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if actor_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Acquire account locks in a consistent order.
+        locked_users = session.scalars(
+            select(User)
+            .where(User.id.in_([actor_id, user_id]))
+            .order_by(User.id)
+            .with_for_update()
         ).all()
 
-        for existing_token in existing_tokens:
-            existing_token.revoked_at = now
+        users_by_id = {user.id: user for user in locked_users}
 
-        raw_token = generate_token()
-        expires_at = now + timedelta(minutes=expiry_minutes)
+        actor = users_by_id.get(actor_id)
+        target = users_by_id.get(user_id)
 
-        reset_token = OneTimeToken(
-            user_id=user.id,
-            purpose="password_reset",
-            token_hash=hash_token(raw_token),
-            pending_email=None,
-            created_at=now,
-            expires_at=expires_at,
+        if actor is None or actor.status != "active" or actor.password_reset_required:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Lock and revalidate the administrator's login session.
+        now = datetime.now(UTC)
+
+        current_session = session.scalar(
+            select(LoginSession)
+            .join(AccessToken, AccessToken.session_id == LoginSession.id)
+            .where(
+                LoginSession.user_id == actor.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+            .with_for_update(of=LoginSession)
         )
 
-        session.add(reset_token)
-        session.add(
-            AuditLog(
-                actor_user_id=actor_id,
-                target_user_id=user_id,
-                action="user.password_reset_issued",
+        if current_session is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        if current_session.revoked_at is not None or current_session.expires_at <= now:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        credential_id = session.scalar(
+            select(AccessToken.id).where(
+                AccessToken.session_id == current_session.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
             )
         )
-        session.flush()
 
-    return raw_token, expires_at
+        if credential_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        if actor.system_role != "administrator":
+            raise AdministratorPasswordResetNotAllowedError(
+                "Administrator privileges are required."
+            )
+
+        if target is None:
+            raise UserNotFoundError("User account not found.")
+
+        if target.status not in ("active", "suspended"):
+            raise PasswordResetNotAllowedError(
+                "Account is not eligible for password recovery."
+            )
+
+        raw_token, expires_at = _issue_password_reset_token(
+            session,
+            actor_id=actor.id,
+            user_id=target.id,
+            expiry_minutes=settings.password_reset_expiry_minutes,
+            now=now,
+        )
+
+        reset_url = build_password_reset_url(
+            settings,
+            token=raw_token,
+        )
+
+    return reset_url, expires_at
 
 
 def reset_user_password(
@@ -907,6 +1124,340 @@ def reset_user_password(
             )
         )
         session.flush()
+
+
+def change_user_password(
+    session: Session,
+    *,
+    access_token: str,
+    current_password: str,
+    new_password: str,
+) -> None:
+    """Change an authenticated user's password and revoke all sessions."""
+    token_digest = hash_token(access_token)
+
+    with session.begin():
+        # Identify the account associated with the access credential.
+        user_id = session.scalar(
+            select(LoginSession.user_id)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(AccessToken.token_hash == token_digest)
+        )
+
+        if user_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Serialize account-level authentication and credential changes.
+        user = session.scalar(select(User).where(User.id == user_id).with_for_update())
+
+        if (
+            user is None
+            or user.status != "active"
+            or user.password_reset_required
+            or user.password_hash is None
+        ):
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Lock and revalidate the authenticated login session.
+        now = datetime.now(UTC)
+
+        current_session = session.scalar(
+            select(LoginSession)
+            .join(
+                AccessToken,
+                AccessToken.session_id == LoginSession.id,
+            )
+            .where(
+                LoginSession.user_id == user.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+                LoginSession.expires_at > now,
+                LoginSession.revoked_at.is_(None),
+            )
+            .with_for_update(of=LoginSession)
+        )
+
+        if current_session is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        now = datetime.now(UTC)
+
+        if current_session.revoked_at is not None or current_session.expires_at <= now:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        credential_id = session.scalar(
+            select(AccessToken.id).where(
+                AccessToken.session_id == current_session.id,
+                AccessToken.token_hash == token_digest,
+                AccessToken.expires_at > now,
+            )
+        )
+
+        if credential_id is None:
+            raise InvalidCredentialsError("Invalid access credential.")
+
+        # Verify the user's current password.
+        if not verify_password(
+            current_password,
+            user.password_hash,
+        ):
+            raise InvalidCredentialsError("Invalid current password.")
+
+        # Enforce the existing password policy.
+        validate_password(new_password)
+
+        # Reject reuse of the current password, including
+        # canonically equivalent Unicode representations.
+        if verify_password(
+            new_password,
+            user.password_hash,
+        ):
+            raise PasswordUnchangedError(
+                "The new password must differ from the current password."
+            )
+
+        new_password_hash = hash_password(new_password)
+
+        # Invalidate outstanding password-reset and email-change credentials.
+        outstanding_tokens = session.scalars(
+            select(OneTimeToken)
+            .where(
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose.in_(("password_reset", "email_change")),
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+            .order_by(OneTimeToken.id)
+            .with_for_update()
+        ).all()
+
+        # Lock every non-revoked session, including the current session.
+        login_sessions = session.scalars(
+            select(LoginSession)
+            .where(
+                LoginSession.user_id == user.id,
+                LoginSession.revoked_at.is_(None),
+            )
+            .order_by(LoginSession.id)
+            .with_for_update()
+        ).all()
+
+        now = datetime.now(UTC)
+
+        for outstanding_token in outstanding_tokens:
+            outstanding_token.revoked_at = now
+
+        for login_session in login_sessions:
+            login_session.refresh_token_hash = None
+            login_session.revoked_at = now
+            login_session.revocation_reason = "password_changed"
+
+        user.password_hash = new_password_hash
+
+        session.add(
+            AuditLog(
+                actor_user_id=user.id,
+                target_user_id=user.id,
+                action="user.password_changed",
+            )
+        )
+
+        session.flush()
+
+
+def reserve_password_reset_attempt(
+    session: Session,
+    *,
+    email: str,
+    source_ip: str,
+    cooldown_seconds: int,
+    email_hourly_limit: int,
+    ip_hourly_limit: int,
+) -> bool:
+    """Atomically reserve a permitted public password-recovery attempt."""
+    if cooldown_seconds < 1:
+        raise ValueError("Password-reset cooldown must be positive.")
+
+    if email_hourly_limit < 1:
+        raise ValueError("Password-reset email hourly limit must be positive.")
+
+    if ip_hourly_limit < 1:
+        raise ValueError("Password-reset IP hourly limit must be positive.")
+
+    try:
+        validated_email = validate_email(
+            email.strip(),
+            check_deliverability=False,
+        )
+    except EmailNotValidError:
+        raise ValueError("Invalid email address.") from None
+
+    normalized_email = validated_email.normalized.casefold()
+
+    email_key = sha256(normalized_email.encode("utf-8")).hexdigest()
+
+    address = ip_address(source_ip)
+
+    # Treat IPv4-mapped IPv6 addresses as their IPv4 equivalents.
+    if isinstance(address, IPv6Address):
+        if address.scope_id is not None:
+            raise ValueError("Scoped IPv6 addresses are not supported.")
+
+        if address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+
+    canonical_ip = str(address)
+
+    lock_keys = sorted(
+        {
+            _password_reset_lock_key("email", email_key),
+            _password_reset_lock_key("ip", canonical_ip),
+        }
+    )
+
+    with session.begin():
+        # Acquire locks in a consistent order across all workers.
+        for lock_key in lock_keys:
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(CAST(:lock_key AS BIGINT))"),
+                {"lock_key": lock_key},
+            )
+
+        now = datetime.now(UTC)
+        cooldown_cutoff = now - timedelta(seconds=cooldown_seconds)
+        hourly_cutoff = now - timedelta(hours=1)
+
+        recent_attempt_id = session.scalar(
+            select(PasswordResetAttempt.id)
+            .where(
+                PasswordResetAttempt.email_key == email_key,
+                PasswordResetAttempt.created_at > cooldown_cutoff,
+            )
+            .limit(1)
+        )
+
+        if recent_attempt_id is not None:
+            return False
+
+        email_attempt_count = session.scalar(
+            select(func.count(PasswordResetAttempt.id)).where(
+                PasswordResetAttempt.email_key == email_key,
+                PasswordResetAttempt.created_at > hourly_cutoff,
+            )
+        )
+
+        if (
+            email_attempt_count is not None
+            and email_attempt_count >= email_hourly_limit
+        ):
+            return False
+
+        ip_attempt_count = session.scalar(
+            select(func.count(PasswordResetAttempt.id)).where(
+                PasswordResetAttempt.source_ip == canonical_ip,
+                PasswordResetAttempt.created_at > hourly_cutoff,
+            )
+        )
+
+        if ip_attempt_count is not None and ip_attempt_count >= ip_hourly_limit:
+            return False
+
+        session.add(
+            PasswordResetAttempt(
+                email_key=email_key,
+                source_ip=canonical_ip,
+                created_at=now,
+            )
+        )
+
+        session.flush()
+
+    return True
+
+
+def record_password_recovery_failure(
+    session: Session,
+    *,
+    user_id: UUID,
+    reason: Literal[
+        "delivery_failed",
+        "account_state_changed",
+    ],
+) -> None:
+    """Persist a failed password-recovery security event."""
+    if reason == "delivery_failed":
+        action = "user.password_reset_delivery_failed"
+        metadata = {"delivery": "email"}
+
+    elif reason == "account_state_changed":
+        action = "user.password_reset_discarded"
+        metadata = {"reason": "account_state_changed"}
+
+    else:
+        raise ValueError("Unsupported password-recovery failure reason.")
+
+    with session.begin():
+        session.add(
+            AuditLog(
+                actor_user_id=None,
+                target_user_id=user_id,
+                action=action,
+                event_metadata=metadata,
+            )
+        )
+
+        session.flush()
+
+
+def prepare_password_recovery(
+    session: Session,
+    *,
+    email: str,
+) -> PasswordRecoveryState | None:
+    """Capture eligible account state before SMTP delivery."""
+    try:
+        validated_email = validate_email(
+            email.strip(),
+            check_deliverability=False,
+        )
+    except EmailNotValidError:
+        raise ValueError("Invalid email address.") from None
+
+    normalized_email = validated_email.normalized.casefold()
+
+    with session.begin():
+        user = session.scalar(
+            select(User)
+            .where(User.normalized_email == normalized_email)
+            .with_for_update()
+        )
+
+        if user is None or user.status not in ("active", "suspended"):
+            return None
+
+        reset_token_ids = session.scalars(
+            select(OneTimeToken.id)
+            .where(
+                OneTimeToken.user_id == user.id,
+                OneTimeToken.purpose == "password_reset",
+                OneTimeToken.consumed_at.is_(None),
+                OneTimeToken.revoked_at.is_(None),
+            )
+            .order_by(OneTimeToken.id)
+        ).all()
+
+        state = PasswordRecoveryState(
+            user_id=user.id,
+            recipient=user.email,
+            normalized_email=user.normalized_email,
+            updated_at=user.updated_at,
+            reset_token_ids=tuple(reset_token_ids),
+        )
+
+    return state
 
 
 def _normalize_email_change_target(  # pyright: ignore[reportUnusedFunction]
@@ -1434,12 +1985,13 @@ def verify_email_change(
 
             stored_token.consumed_at = now
 
-            # Invalidate other outstanding email-change credentials.
+            # Invalidate outstanding credentials associated with
+            # the previous account email.
             other_tokens = session.scalars(
                 select(OneTimeToken)
                 .where(
                     OneTimeToken.user_id == user.id,
-                    OneTimeToken.purpose == "email_change",
+                    OneTimeToken.purpose.in_(("email_change", "password_reset")),
                     OneTimeToken.id != stored_token.id,
                     OneTimeToken.consumed_at.is_(None),
                     OneTimeToken.revoked_at.is_(None),
@@ -3170,11 +3722,13 @@ def change_user_email_as_administrator(
                     "A user with this email address already exists."
                 )
 
+            # Invalidate outstanding credentials associated with
+            # the previous account email.
             pending_tokens = session.scalars(
                 select(OneTimeToken)
                 .where(
                     OneTimeToken.user_id == target.id,
-                    OneTimeToken.purpose == "email_change",
+                    OneTimeToken.purpose.in_(("email_change", "password_reset")),
                     OneTimeToken.consumed_at.is_(None),
                     OneTimeToken.revoked_at.is_(None),
                 )
@@ -3371,3 +3925,47 @@ def cleanup_inactive_sessions(
         )
 
         return len(session_ids)
+
+
+def cleanup_password_reset_attempts(
+    session: Session,
+    *,
+    now: datetime,
+    cooldown_seconds: int,
+    batch_size: int,
+) -> int:
+    """Delete one bounded batch of obsolete recovery attempts."""
+    if cooldown_seconds < 1:
+        raise ValueError("Password-reset cooldown must be positive.")
+
+    if batch_size < 1:
+        raise ValueError("Cleanup batch size must be positive.")
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Cleanup time must be timezone-aware.")
+
+    retention_seconds = max(3600, cooldown_seconds)
+
+    cutoff = now - timedelta(seconds=retention_seconds)
+
+    with session.begin():
+        attempt_ids = session.scalars(
+            select(PasswordResetAttempt.id)
+            .where(
+                PasswordResetAttempt.created_at <= cutoff,
+            )
+            .order_by(PasswordResetAttempt.id)
+            .limit(batch_size)
+            .with_for_update(skip_locked=True)
+        ).all()
+
+        if not attempt_ids:
+            return 0
+
+        session.execute(
+            delete(PasswordResetAttempt).where(
+                PasswordResetAttempt.id.in_(attempt_ids),
+            )
+        )
+
+        return len(attempt_ids)
